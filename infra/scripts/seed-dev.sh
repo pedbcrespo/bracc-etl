@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CYPHER_FILE="${SCRIPT_DIR}/seed-dev.cypher"
 NEO4J_URI="${NEO4J_URI:-bolt://localhost:7687}"
 NEO4J_USER="${NEO4J_USER:-neo4j}"
-NEO4J_PASSWORD="${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}"
+NEO4J_PASSWORD="${NEO4J_PASSWORD:?changeme}"
 
 echo "Seeding Neo4j at ${NEO4J_URI}..."
 

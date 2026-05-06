@@ -69,19 +69,6 @@ class CamaraInquiriesPipeline(Pipeline):
     ) -> None:
         super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-        self._raw_inquiries: pd.DataFrame = pd.DataFrame()
-        self._raw_requirements: pd.DataFrame = pd.DataFrame()
-        self._raw_sessions: pd.DataFrame = pd.DataFrame()
-
-        self.inquiries: list[dict[str, Any]] = []
-        self.requirements: list[dict[str, Any]] = []
-        self.sessions: list[dict[str, Any]] = []
-        self.inquiry_requirement_rels: list[dict[str, Any]] = []
-        self.inquiry_session_rels: list[dict[str, Any]] = []
-        self.requirement_author_cpf_rels: list[dict[str, Any]] = []
-        self.requirement_author_name_rels: list[dict[str, Any]] = []
-        self.requirement_company_mentions: list[dict[str, Any]] = []
-
         self.run_id = f"{self.name}_{pd.Timestamp.utcnow().strftime('%Y%m%d%H%M%S')}"
 
     def _read_csv_optional(self, path: Path) -> pd.DataFrame:
@@ -126,23 +113,20 @@ class CamaraInquiriesPipeline(Pipeline):
         )
         return dict_result
 
-    def transform(self, data: dict[str, pd.DataFrame]) -> None:
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
         raw_inquiries = data["raw_inquiries"]
         raw_requirements = data["raw_requirements"]
         raw_sessions = data["raw_sessions"]
 
-        dict_result: dict[str, list[dict[str, Any]]] = {
-                "inquiries": [],
-                "requirements": [],
-                "sessions": [],
-        }   
+        dict_result: dict[str, list[dict[str, Any]]] = {}   
 
         if raw_inquiries.empty:
-            return
+            return {}
 
         dict_result.update(self._transform_inquiries(raw_inquiries))
         dict_result.update(self._transform_requirements(raw_requirements))
         dict_result.update(self._transform_sessions(raw_sessions))
+        return dict_result
 
     def _transform_inquiries(self, raw_inquiries: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         rows: list[dict[str, Any]] = []
@@ -303,65 +287,76 @@ class CamaraInquiriesPipeline(Pipeline):
             })
             rels.append({"source_key": inquiry_id, "target_key": session_id})
 
-        self.sessions = deduplicate_rows(sessions, ["session_id"])
-        self.inquiry_session_rels = rels
+        return {
+            "sessions": deduplicate_rows(sessions, ["session_id"]),
+            "inquiry_session_rels": rels,
+        }
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        inquiries = data.get("inquiries", [])
+        requirements = data.get("requirements", [])
+        sessions = data.get("sessions", [])
+        inquiry_requirement_rels = data.get("inquiry_requirement_rels", [])
+        inquiry_session_rels = data.get("inquiry_session_rels", [])
+        requirement_author_cpf_rels = data.get("requirement_author_cpf_rels", [])
+        requirement_author_name_rels = data.get("requirement_author_name_rels", [])
+        requirement_company_mentions = data.get("requirement_company_mentions", [])
+
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.inquiries:
-            loader.load_nodes("Inquiry", self.inquiries, key_field="inquiry_id")
+        if inquiries:
+            loader.load_nodes("Inquiry", inquiries, key_field="inquiry_id")
 
-        if self.requirements:
-            loader.load_nodes("InquiryRequirement", self.requirements, key_field="requirement_id")
+        if requirements:
+            loader.load_nodes("InquiryRequirement", requirements, key_field="requirement_id")
 
-        if self.sessions:
-            loader.load_nodes("InquirySession", self.sessions, key_field="session_id")
+        if sessions:
+            loader.load_nodes("InquirySession", sessions, key_field="session_id")
 
-        if self.inquiry_requirement_rels:
+        if inquiry_requirement_rels:
             loader.load_relationships(
                 rel_type="TEM_REQUERIMENTO",
-                rows=self.inquiry_requirement_rels,
+                rows=inquiry_requirement_rels,
                 source_label="Inquiry",
                 source_key="inquiry_id",
                 target_label="InquiryRequirement",
                 target_key="requirement_id",
             )
 
-        if self.inquiry_session_rels:
+        if inquiry_session_rels:
             loader.load_relationships(
                 rel_type="REALIZOU_SESSAO",
-                rows=self.inquiry_session_rels,
+                rows=inquiry_session_rels,
                 source_label="Inquiry",
                 source_key="inquiry_id",
                 target_label="InquirySession",
                 target_key="session_id",
             )
 
-        if self.requirement_author_cpf_rels:
+        if requirement_author_cpf_rels:
             loader.load_relationships(
                 rel_type="PROPOS_REQUERIMENTO",
-                rows=self.requirement_author_cpf_rels,
+                rows=requirement_author_cpf_rels,
                 source_label="Person",
                 source_key="cpf",
                 target_label="InquiryRequirement",
                 target_key="requirement_id",
             )
 
-        if self.requirement_author_name_rels:
+        if requirement_author_name_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person) WHERE p.name = row.person_name "
                 "MATCH (r:InquiryRequirement {requirement_id: row.target_key}) "
                 "MERGE (p)-[:PROPOS_REQUERIMENTO]->(r)"
             )
-            loader.run_query_with_retry(query, self.requirement_author_name_rels)
+            loader.run_query_with_retry(query, requirement_author_name_rels)
 
-        if self.requirement_company_mentions:
+        if requirement_company_mentions:
             companies = deduplicate_rows(
                 [
                     {"cnpj": row["cnpj"], "razao_social": row["cnpj"]}
-                    for row in self.requirement_company_mentions
+                    for row in requirement_company_mentions
                 ],
                 ["cnpj"],
             )
@@ -377,4 +372,4 @@ class CamaraInquiriesPipeline(Pipeline):
                 "m.source_ref = row.source_ref, "
                 "m.run_id = row.run_id"
             )
-            loader.run_query_with_retry(query, self.requirement_company_mentions)
+            loader.run_query_with_retry(query, requirement_company_mentions)
