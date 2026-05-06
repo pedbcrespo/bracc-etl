@@ -233,7 +233,7 @@ class CamaraPipeline(Pipeline):
                 keep_default_na=False,
                 chunksize=self.chunk_size,
             )
-            logger.info("  Lidos %d linhas", len(df))
+            logger.info("  df lido com pandas")
 
             (
                 expenses, deputies_cpf, deputies_id,
