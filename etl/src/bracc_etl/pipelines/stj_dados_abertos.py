@@ -41,36 +41,29 @@ class StjPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(
-            driver, data_dir, limit=limit,
-            chunk_size=chunk_size, **kwargs,
-        )
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.cases: list[dict[str, Any]] = []
-        self.rapporteur_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         src_dir = Path(self.data_dir) / "stj_dados_abertos"
         csv_path = src_dir / "decisoes.csv"
+        raw: pd.DataFrame = pd.DataFrame()
         if not csv_path.exists():
             msg = f"STJ CSV not found: {csv_path}"
             raise FileNotFoundError(msg)
 
-        self._raw = pd.read_csv(
-            csv_path, dtype=str, keep_default_na=False,
-        )
+        raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False, chunksize=self.chunk_size)
         logger.info(
-            "[stj] Extracted %d case records", len(self._raw),
+            "[stj] Extracted %d case records", len(raw),
         )
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         cases: list[dict[str, Any]] = []
         rapporteur_rels: list[dict[str, Any]] = []
-
-        for row in self._raw.itertuples(index=False):
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        for row in data.itertuples(index=False):
             case_class = str(
                 getattr(row, "classe", "")
             ).strip()
@@ -124,21 +117,22 @@ class StjPipeline(Pipeline):
             if self.limit and len(cases) >= self.limit:
                 break
 
-        self.cases = deduplicate_rows(cases, ["case_id"])
-        self.rapporteur_rels = rapporteur_rels
+        dict_result["cases"] = deduplicate_rows(cases, ["case_id"])
+        dict_result["rapporteur_rels"] = rapporteur_rels
         logger.info(
-            "[stj] Transformed %d cases", len(self.cases),
+            "[stj] Transformed %d cases", len(dict_result["cases"]),
         )
+        return dict_result
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.cases:
+        if data.get("cases"):
             loader.load_nodes(
-                "LegalCase", self.cases, key_field="case_id",
+                "LegalCase", data["cases"], key_field="case_id",
             )
 
-        if self.rapporteur_rels:
+        if data.get("rapporteur_rels"):
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (p:Person {name: row.source_key}) "
@@ -147,5 +141,5 @@ class StjPipeline(Pipeline):
                 "MERGE (p)-[:RELATOR_DE]->(lc)"
             )
             loader.run_query_with_retry(
-                query, self.rapporteur_rels,
+                query, data["rapporteur_rels"],
             )

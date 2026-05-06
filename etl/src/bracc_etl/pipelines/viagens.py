@@ -103,17 +103,14 @@ class ViagensPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.travels: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         viagens_dir = Path(self.data_dir) / "viagens"
         csv_files = sorted(viagens_dir.glob("*.csv"))
+        raw: pd.DataFrame = pd.DataFrame()
         if not csv_files:
             msg = f"No CSV files found in {viagens_dir}"
             raise FileNotFoundError(msg)
@@ -127,6 +124,7 @@ class ViagensPipeline(Pipeline):
                     delimiter=";",
                     encoding="latin-1",
                     keep_default_na=False,
+                    chunksize=self.chunk_size
                 )
                 df = _normalize_columns(df)
                 frames.append(df)
@@ -135,14 +133,15 @@ class ViagensPipeline(Pipeline):
                 logger.warning("[viagens] Failed to read %s", csv_path.name)
 
         if frames:
-            self._raw = pd.concat(frames, ignore_index=True)
-        logger.info("[viagens] Extracted %d total rows", len(self._raw))
+            raw = pd.concat(frames, ignore_index=True)
+        logger.info("[viagens] Extracted %d total rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         travels: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
-
-        for _, row in self._raw.iterrows():
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        for _, row in data.iterrows():
             cpf_raw = str(row.get("cpf", "")).strip()
             digits = strip_document(cpf_raw)
 
@@ -189,23 +188,25 @@ class ViagensPipeline(Pipeline):
 
             if self.limit and len(travels) >= self.limit:
                 break
-
-        self.travels = deduplicate_rows(travels, ["travel_id"])
-        self.person_rels = person_rels
+        dict_result = {
+            "travels": deduplicate_rows(travels, ["travel_id"]),
+            "person_rels": person_rels,
+        }
         logger.info(
             "[viagens] Transformed %d travel records, %d person links",
-            len(self.travels),
-            len(self.person_rels),
+            len(dict_result["travels"]),
+            len(dict_result["person_rels"]),
         )
+        return dict_result
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.travels:
-            loaded = loader.load_nodes("GovTravel", self.travels, key_field="travel_id")
+        if data["travels"]:
+            loaded = loader.load_nodes("GovTravel", data["travels"], key_field="travel_id")
             logger.info("[viagens] Loaded %d GovTravel nodes", loaded)
 
-        if self.person_rels:
+        if data["person_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (p:Person {cpf: row.source_key}) "
@@ -214,5 +215,5 @@ class ViagensPipeline(Pipeline):
                 "MATCH (t:GovTravel {travel_id: row.target_key}) "
                 "MERGE (p)-[:VIAJOU]->(t)"
             )
-            loaded = loader.run_query_with_retry(query, self.person_rels)
+            loaded = loader.run_query_with_retry(query, data["person_rels"])
             logger.info("[viagens] Loaded %d VIAJOU relationships", loaded)

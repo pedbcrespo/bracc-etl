@@ -38,27 +38,24 @@ class StfPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.cases: list[dict[str, Any]] = []
-        self.rapporteur_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         stf_dir = Path(self.data_dir) / "stf"
-        self._raw = pd.read_csv(
+        return pd.read_csv(
             stf_dir / "decisoes.csv",
             dtype=str,
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         cases: list[dict[str, Any]] = []
         rapporteur_rels: list[dict[str, Any]] = []
 
-        for _idx, row in self._raw.iterrows():
+        for _idx, row in data.iterrows():
             case_class = str(row.get("classe", "")).strip()
             case_number = str(row.get("numero", "")).strip()
             year = str(row.get("ano", "")).strip()
@@ -102,20 +99,22 @@ class StfPipeline(Pipeline):
                     }
                 )
 
-        self.cases = deduplicate_rows(cases, ["case_id"])
-        self.rapporteur_rels = rapporteur_rels
+        return {
+            "cases": deduplicate_rows(cases, ["case_id"]),
+            "rapporteur_rels": rapporteur_rels
+        }
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.cases:
-            loader.load_nodes("LegalCase", self.cases, key_field="case_id")
+        if data.get("cases"):
+            loader.load_nodes("LegalCase", data["cases"], key_field="case_id")
 
-        if self.rapporteur_rels:
+        if data.get("rapporteur_rels"):
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {name: row.source_key}) "
                 "MATCH (lc:LegalCase {case_id: row.target_key}) "
                 "MERGE (p)-[:RELATOR_DE]->(lc)"
             )
-            loader.run_query_with_retry(query, self.rapporteur_rels)
+            loader.run_query_with_retry(query, data["rapporteur_rels"])

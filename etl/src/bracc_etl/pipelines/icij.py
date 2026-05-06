@@ -41,18 +41,9 @@ class ICIJPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._entities_raw: pd.DataFrame = pd.DataFrame()
-        self._officers_raw: pd.DataFrame = pd.DataFrame()
-        self._intermediaries_raw: pd.DataFrame = pd.DataFrame()
-        self._relationships_raw: pd.DataFrame = pd.DataFrame()
-        self.offshore_entities: list[dict[str, Any]] = []
-        self.offshore_officers: list[dict[str, Any]] = []
-        self.officer_of_rels: list[dict[str, Any]] = []
-        self.intermediary_of_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
     @staticmethod
     def _is_brazilian(row: pd.Series) -> bool:
@@ -69,7 +60,7 @@ class ICIJPipeline(Pipeline):
                     return True
         return False
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         icij_dir = Path(self.data_dir) / "icij"
 
         entities_path = icij_dir / "nodes-entities.csv"
@@ -77,32 +68,44 @@ class ICIJPipeline(Pipeline):
         intermediaries_path = icij_dir / "nodes-intermediaries.csv"
         rels_path = icij_dir / "relationships.csv"
 
+        entities_raw: pd.DataFrame = pd.DataFrame()
+        officers_raw: pd.DataFrame = pd.DataFrame()
+        intermediaries_raw: pd.DataFrame = pd.DataFrame()
+        relationships_raw: pd.DataFrame = pd.DataFrame()
+
         read_opts: dict[str, Any] = {
             "dtype": str,
             "keep_default_na": False,
         }
 
         if entities_path.exists():
-            self._entities_raw = pd.read_csv(entities_path, **read_opts)
-            logger.info("[icij] Extracted %d entities", len(self._entities_raw))
+            entities_raw = pd.read_csv(entities_path, **read_opts, chunksize=self.chunk_size)
+            logger.info("[icij] Extracted %d entities", len(entities_raw))
 
         if officers_path.exists():
-            self._officers_raw = pd.read_csv(officers_path, **read_opts)
-            logger.info("[icij] Extracted %d officers", len(self._officers_raw))
+            officers_raw = pd.read_csv(officers_path, **read_opts, chunksize=self.chunk_size)
+            logger.info("[icij] Extracted %d officers", len(officers_raw))
 
         if intermediaries_path.exists():
-            self._intermediaries_raw = pd.read_csv(intermediaries_path, **read_opts)
-            logger.info("[icij] Extracted %d intermediaries", len(self._intermediaries_raw))
+            intermediaries_raw = pd.read_csv(intermediaries_path, **read_opts, chunksize=self.chunk_size)
+            logger.info("[icij] Extracted %d intermediaries", len(intermediaries_raw))
 
         if rels_path.exists():
-            self._relationships_raw = pd.read_csv(rels_path, **read_opts)
-            logger.info("[icij] Extracted %d relationships", len(self._relationships_raw))
+            relationships_raw = pd.read_csv(rels_path, **read_opts, chunksize=self.chunk_size)
+            logger.info("[icij] Extracted %d relationships", len(relationships_raw))
 
-    def _transform_entities(self) -> list[dict[str, Any]]:
+        return {
+            "entities": entities_raw,
+            "officers": officers_raw,
+            "intermediaries": intermediaries_raw,
+            "relationships": relationships_raw
+        }
+
+    def _transform_entities(self, entities_raw: pd.DataFrame) -> list[dict[str, Any]]:
         """Transform ICIJ entity nodes, filtering for Brazilian connections."""
         entities: list[dict[str, Any]] = []
 
-        for _, row in self._entities_raw.iterrows():
+        for _, row in  entities_raw.iterrows():
             if not self._is_brazilian(row):
                 continue
 
@@ -129,11 +132,11 @@ class ICIJPipeline(Pipeline):
 
         return entities
 
-    def _transform_officers(self) -> list[dict[str, Any]]:
+    def _transform_officers(self, officers_raw: pd.DataFrame) -> list[dict[str, Any]]:
         """Transform ICIJ officer nodes, filtering for Brazilian connections."""
         officers: list[dict[str, Any]] = []
 
-        for _, row in self._officers_raw.iterrows():
+        for _, row in officers_raw.iterrows():
             if not self._is_brazilian(row):
                 continue
 
@@ -156,15 +159,15 @@ class ICIJPipeline(Pipeline):
 
         return officers
 
-    def _transform_relationships(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _transform_relationships(self, relationships_raw: pd.DataFrame, offshore_entities: list[dict[str, Any]], offshore_officers: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Build OFFICER_OF and INTERMEDIARY_OF relationships from the relationships CSV."""
         officer_rels: list[dict[str, Any]] = []
         intermediary_rels: list[dict[str, Any]] = []
 
-        entity_ids = {e["offshore_id"] for e in self.offshore_entities}
-        officer_ids = {o["offshore_officer_id"] for o in self.offshore_officers}
+        entity_ids = {e["offshore_id"] for e in offshore_entities}
+        officer_ids = {o["offshore_officer_id"] for o in offshore_officers}
 
-        for _, row in self._relationships_raw.iterrows():
+        for _, row in relationships_raw.iterrows():
             node_id_start = str(row.get("node_id_start", "")).strip()
             node_id_end = str(row.get("node_id_end", "")).strip()
             rel_type = str(row.get("rel_type", "")).strip().lower()
@@ -193,40 +196,39 @@ class ICIJPipeline(Pipeline):
 
         return officer_rels, intermediary_rels
 
-    def transform(self) -> None:
-        self.offshore_entities = deduplicate_rows(
-            self._transform_entities(), ["offshore_id"]
-        )
-        self.offshore_officers = deduplicate_rows(
-            self._transform_officers(), ["offshore_officer_id"]
-        )
-        self.officer_of_rels, self.intermediary_of_rels = self._transform_relationships()
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        dict_result: dict[str, list[dict[str, Any]]] = {
+            "offshore_entities": deduplicate_rows(self._transform_entities(data["entities"]), ["offshore_id"]),
+            "offshore_officers": deduplicate_rows(self._transform_officers(data["officers"]), ["offshore_officer_id"]),
+        }
+        dict_result["officer_of_rels"], dict_result["intermediary_of_rels"] = self._transform_relationships(data["relationships"], dict_result["offshore_entities"], dict_result["offshore_officers"])
 
         logger.info(
             "[icij] Transformed %d OffshoreEntity, %d OffshoreOfficer, "
             "%d OFFICER_OF, %d INTERMEDIARY_OF",
-            len(self.offshore_entities),
-            len(self.offshore_officers),
-            len(self.officer_of_rels),
-            len(self.intermediary_of_rels),
+            len(dict_result["offshore_entities"]),
+            len(dict_result["offshore_officers"]),
+            len(dict_result["officer_of_rels"]),
+            len(dict_result["intermediary_of_rels"]),
         )
+        return dict_result
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.offshore_entities:
+        if data["offshore_entities"]:
             loaded = loader.load_nodes(
-                "OffshoreEntity", self.offshore_entities, key_field="offshore_id"
+                "OffshoreEntity", data["offshore_entities"], key_field="offshore_id"
             )
             logger.info("[icij] Loaded %d OffshoreEntity nodes", loaded)
 
-        if self.offshore_officers:
+        if data["offshore_officers"]:
             loaded = loader.load_nodes(
-                "OffshoreOfficer", self.offshore_officers, key_field="offshore_officer_id"
+                "OffshoreOfficer", data["offshore_officers"], key_field="offshore_officer_id"
             )
             logger.info("[icij] Loaded %d OffshoreOfficer nodes", loaded)
 
-        if self.officer_of_rels:
+        if data["officer_of_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (o:OffshoreOfficer {offshore_officer_id: row.source_key}) "
@@ -235,10 +237,10 @@ class ICIJPipeline(Pipeline):
                 "SET r.link = row.link, "
                 "    r.source_investigation = row.source_investigation"
             )
-            loaded = loader.run_query_with_retry(query, self.officer_of_rels)
+            loaded = loader.run_query_with_retry(query, data["officer_of_rels"])
             logger.info("[icij] Loaded %d OFFICER_OF relationships", loaded)
 
-        if self.intermediary_of_rels:
+        if data["intermediary_of_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (i:OffshoreOfficer {offshore_officer_id: row.source_key}) "
@@ -247,5 +249,5 @@ class ICIJPipeline(Pipeline):
                 "SET r.link = row.link, "
                 "    r.source_investigation = row.source_investigation"
             )
-            loaded = loader.run_query_with_retry(query, self.intermediary_of_rels)
+            loaded = loader.run_query_with_retry(query, data["intermediary_of_rels"])
             logger.info("[icij] Loaded %d INTERMEDIARY_OF relationships", loaded)

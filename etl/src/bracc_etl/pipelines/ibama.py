@@ -39,15 +39,9 @@ class IbamaPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.embargoes: list[dict[str, Any]] = []
-        self.companies: list[dict[str, Any]] = []
-        self.persons: list[dict[str, Any]] = []
-        self.embargo_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
     def _parse_area(self, value: str) -> float:
         """Parse area in hectares (Brazilian decimal format: comma separator)."""
@@ -64,17 +58,18 @@ class IbamaPipeline(Pipeline):
             return ""
         return value.split(",")[0].strip()
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         ibama_dir = Path(self.data_dir) / "ibama"
+        raw: pd.DataFrame = pd.DataFrame()
         if not ibama_dir.exists():
             logger.warning("[%s] Data directory not found: %s", self.name, ibama_dir)
-            return
+            return raw
         csv_path = ibama_dir / "areas_embargadas.csv"
         if not csv_path.exists():
             logger.warning("[%s] CSV file not found: %s", self.name, csv_path)
-            return
+            return raw
         logger.info("[ibama] Reading %s", csv_path)
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             sep=";",
             dtype=str,
@@ -84,16 +79,17 @@ class IbamaPipeline(Pipeline):
             usecols=lambda c: c != "WKT_GEOM_AREA_EMBARGADA",
         )
         if self.limit:
-            self._raw = self._raw.head(self.limit)
-        logger.info("[ibama] Extracted %d rows", len(self._raw))
+            raw = raw.head(self.limit)
+        logger.info("[ibama] Extracted %d rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         embargoes: list[dict[str, Any]] = []
         companies: list[dict[str, Any]] = []
         persons: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             seq = str(row["SEQ_TAD"]).strip()
             if not seq:
                 continue
@@ -150,36 +146,43 @@ class IbamaPipeline(Pipeline):
                 "is_company": is_company,
             })
 
-        self.embargoes = deduplicate_rows(embargoes, ["embargo_id"])
-        self.companies = deduplicate_rows(companies, ["cnpj"])
-        self.persons = deduplicate_rows(persons, ["cpf"])
-        self.embargo_rels = rels
+        embargoes = deduplicate_rows(embargoes, ["embargo_id"])
+        companies = deduplicate_rows(companies, ["cnpj"])
+        persons = deduplicate_rows(persons, ["cpf"])
+        embargo_rels = rels
 
         logger.info(
             "[ibama] Transformed: %d embargoes, %d companies, %d persons, %d rels",
-            len(self.embargoes),
-            len(self.companies),
-            len(self.persons),
-            len(self.embargo_rels),
+            len(embargoes),
+            len(companies),
+            len(persons),
+            len(embargo_rels),
         )
 
-    def load(self) -> None:
+        return {
+            "embargoes": embargoes,
+            "companies": companies,
+            "persons": persons,
+            "embargo_rels": embargo_rels,
+        }
+
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.embargoes:
-            logger.info("[ibama] Loading %d Embargo nodes...", len(self.embargoes))
-            loader.load_nodes("Embargo", self.embargoes, key_field="embargo_id")
+        if data["embargoes"]:
+            logger.info("[ibama] Loading %d Embargo nodes...", len(data["embargoes"]))
+            loader.load_nodes("Embargo", data["embargoes"], key_field="embargo_id")
 
-        if self.companies:
-            logger.info("[ibama] MERGEing %d Company nodes...", len(self.companies))
-            loader.load_nodes("Company", self.companies, key_field="cnpj")
+        if data["companies"]:
+            logger.info("[ibama] MERGEing %d Company nodes...", len(data["companies"]))
+            loader.load_nodes("Company", data["companies"], key_field="cnpj")
 
-        if self.persons:
-            logger.info("[ibama] MERGEing %d Person nodes...", len(self.persons))
-            loader.load_nodes("Person", self.persons, key_field="cpf")
+        if data["persons"]:
+            logger.info("[ibama] MERGEing %d Person nodes...", len(data["persons"]))
+            loader.load_nodes("Person", data["persons"], key_field="cpf")
 
-        if self.embargo_rels:
-            logger.info("[ibama] Loading %d EMBARGADA rels...", len(self.embargo_rels))
+        if data["embargo_rels"]:
+            logger.info("[ibama] Loading %d EMBARGADA rels...", len(data["embargo_rels"]))
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (e:Embargo {embargo_id: row.target_key}) "
@@ -189,6 +192,6 @@ class IbamaPipeline(Pipeline):
                 "WHERE entity IS NOT NULL "
                 "MERGE (entity)-[:EMBARGADA]->(e)"
             )
-            loader.run_query_with_retry(query, self.embargo_rels)
+            loader.run_query(query, data["embargo_rels"])
 
         logger.info("[ibama] Load complete.")

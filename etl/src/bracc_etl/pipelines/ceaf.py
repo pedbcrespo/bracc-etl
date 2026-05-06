@@ -44,7 +44,7 @@ class CeafPipeline(Pipeline):
             chunksize=self.chunk_size,
         )
 
-    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    def transform(self, data) -> dict[str, list[dict[str, Any]]]:
         expulsions: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
 
@@ -89,30 +89,31 @@ class CeafPipeline(Pipeline):
                     "target_key": expulsion_id,
                     "person_name": nome,
                 })
+
         return {
             "expulsions": deduplicate_rows(expulsions, ["expulsion_id"]),
-            "person_rels": person_rels, 
+            "person_rels": person_rels
         }
 
-    def load(self, transformed_data: dict[str, list[dict[str, Any]]]) -> None:
+    def load(self, data) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if transformed_data["expulsions"]:
-            loader.load_nodes("Expulsion", transformed_data["expulsions"], key_field="expulsion_id")
+        if data["expulsions"]:
+            loader.load_nodes("Expulsion", data["expulsions"], key_field="expulsion_id")
 
         # Ensure Person nodes exist
-        for rel in transformed_data["person_rels"]:
+        for rel in data["person_rels"]:
             loader.load_nodes(
                 "Person",
                 [{"cpf": rel["source_key"], "name": rel["person_name"]}],
                 key_field="cpf",
             )
 
-        if transformed_data["person_rels"]:
+        if data["person_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
                 "MATCH (e:Expulsion {expulsion_id: row.target_key}) "
                 "MERGE (p)-[:EXPULSO]->(e)"
             )
-            loader.run_query_with_retry(query, transformed_data["person_rels"])
+            loader.run_query_with_retry(query, data["person_rels"])

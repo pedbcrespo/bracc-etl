@@ -50,35 +50,35 @@ class TseBensPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.assets: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
+        raw: pd.DataFrame = pd.DataFrame()
         bens_dir = Path(self.data_dir) / "tse_bens"
         csv_path = bens_dir / "bens.csv"
         if not csv_path.exists():
             msg = f"Data file not found: {csv_path}"
             raise FileNotFoundError(msg)
 
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
         if self.limit:
-            self._raw = self._raw.head(self.limit)
-        logger.info("[tse_bens] Extracted %d rows", len(self._raw))
+            raw = raw.head(self.limit)
+        logger.info("[tse_bens] Extracted %d rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, raw: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         assets: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-        for _idx, row in self._raw.iterrows():
+        for _idx, row in raw.iterrows():
             cpf_raw = str(row.get("cpf", ""))
             digits = strip_document(cpf_raw)
 
@@ -116,24 +116,26 @@ class TseBensPipeline(Pipeline):
                 "person_name": nome,
             })
 
-        self.assets = deduplicate_rows(assets, ["asset_id"])
-        self.person_rels = person_rels
+        dict_result["assets"] = deduplicate_rows(assets, ["asset_id"])
+        dict_result["person_rels"] = person_rels
+
         logger.info(
             "[tse_bens] Transformed: %d assets, %d person rels",
-            len(self.assets),
-            len(self.person_rels),
+            len(dict_result["assets"]),
+            len(dict_result["person_rels"]),
         )
+        return dict_result  
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.assets:
-            loader.load_nodes("DeclaredAsset", self.assets, key_field="asset_id")
+        if data["assets"]:
+            loader.load_nodes("DeclaredAsset", data["assets"], key_field="asset_id")
 
         # Ensure Person nodes exist for each candidate
         persons_seen: set[str] = set()
         unique_persons: list[dict[str, Any]] = []
-        for rel in self.person_rels:
+        for rel in data["person_rels"]:
             cpf = rel["source_key"]
             if cpf not in persons_seen:
                 persons_seen.add(cpf)
@@ -141,18 +143,18 @@ class TseBensPipeline(Pipeline):
         if unique_persons:
             loader.load_nodes("Person", unique_persons, key_field="cpf")
 
-        if self.person_rels:
+        if data["person_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
                 "MATCH (a:DeclaredAsset {asset_id: row.target_key}) "
                 "MERGE (p)-[:DECLAROU_BEM]->(a)"
             )
-            loader.run_query_with_retry(query, self.person_rels)
+            loader.run_query_with_retry(query, data["person_rels"])
 
         logger.info(
             "[tse_bens] Loaded: %d assets, %d persons, %d rels",
-            len(self.assets),
+            len(data["assets"]),
             len(persons_seen),
-            len(self.person_rels),
+            len(data["person_rels"]),
         )

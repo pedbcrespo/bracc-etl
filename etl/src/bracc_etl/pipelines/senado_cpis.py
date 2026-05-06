@@ -107,94 +107,77 @@ class SenadoCpisPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-
-        self._raw_inquiries: pd.DataFrame = pd.DataFrame()
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self._raw_requirements: pd.DataFrame = pd.DataFrame()
-        self._raw_sessions: pd.DataFrame = pd.DataFrame()
-        self._raw_members: pd.DataFrame = pd.DataFrame()
-        self._raw_history_sources: pd.DataFrame = pd.DataFrame()
-
-        # Backward-compatible outputs
-        self.cpis: list[dict[str, Any]] = []
-        self.senator_rels: list[dict[str, Any]] = []
-
-        # New model outputs
-        self.inquiries: list[dict[str, Any]] = []
-        self.inquiry_requirements: list[dict[str, Any]] = []
-        self.inquiry_sessions: list[dict[str, Any]] = []
-        self.inquiry_requirement_rels: list[dict[str, Any]] = []
-        self.inquiry_session_rels: list[dict[str, Any]] = []
-        self.inquiry_member_rels: list[dict[str, Any]] = []
-        self.requirement_author_cpf_rels: list[dict[str, Any]] = []
-        self.requirement_author_name_rels: list[dict[str, Any]] = []
-        self.requirement_company_mentions: list[dict[str, Any]] = []
-        self.temporal_violations: list[dict[str, Any]] = []
-        self.source_documents: list[dict[str, Any]] = []
-        self._inquiry_date_lookup: dict[str, tuple[str, str]] = {}
-
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self.run_id = f"{self.name}_{pd.Timestamp.utcnow().strftime('%Y%m%d%H%M%S')}"
 
     def _read_csv_optional(self, path: Path) -> pd.DataFrame:
         if not path.exists():
             return pd.DataFrame()
         try:
-            return pd.read_csv(path, dtype=str, keep_default_na=False)
+            return pd.read_csv(path, dtype=str, keep_default_na=False, chunksize=self.chunk_size)
         except pd.errors.EmptyDataError:
             logger.info("[senado_cpis] empty file (treated as no data): %s", path.name)
             return pd.DataFrame()
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         src_dir = Path(self.data_dir) / "senado_cpis"
+
+        dict_result: dict[str, pd.DataFrame] = {}
+
         if not src_dir.exists():
             logger.warning("[senado_cpis] data dir not found: %s", src_dir)
-            return
+            return {}
 
         inquiries_csv = src_dir / "inquiries.csv"
         legacy_csv = src_dir / "cpis.csv"
 
         if inquiries_csv.exists():
-            self._raw_inquiries = self._read_csv_optional(inquiries_csv)
+            dict_result["raw_inquiries"] = self._read_csv_optional(inquiries_csv)
         elif legacy_csv.exists():
-            self._raw_inquiries = self._read_csv_optional(legacy_csv)
+            dict_result["raw_inquiries"] = self._read_csv_optional(legacy_csv)
         else:
             logger.warning("[senado_cpis] inquiries.csv/cpis.csv not found in %s", src_dir)
-            return
+            return {}
 
-        self._raw_requirements = self._read_csv_optional(src_dir / "requirements.csv")
-        self._raw_sessions = self._read_csv_optional(src_dir / "sessions.csv")
-        self._raw_members = self._read_csv_optional(src_dir / "members.csv")
-        self._raw_history_sources = self._read_csv_optional(src_dir / "history_sources.csv")
+        dict_result["raw_requirements"] = self._read_csv_optional(src_dir / "requirements.csv")
+        dict_result["raw_sessions"] = self._read_csv_optional(src_dir / "sessions.csv")
+        dict_result["raw_members"] = self._read_csv_optional(src_dir / "members.csv")
+        dict_result["raw_history_sources"] = self._read_csv_optional(src_dir / "history_sources.csv")
 
         if self.limit:
-            self._raw_inquiries = self._raw_inquiries.head(self.limit)
-        self._raw = self._raw_inquiries
+            for key, df in dict_result.items():
+                dict_result[key] = df.head(self.limit)
+        dict_result["raw"] = dict_result["raw_inquiries"]
 
         logger.info(
             "[senado_cpis] extracted inquiries=%d requirements=%d sessions=%d members=%d",
-            len(self._raw_inquiries),
-            len(self._raw_requirements),
-            len(self._raw_sessions),
-            len(self._raw_members),
+            len(dict_result["raw_inquiries"]),
+            len(dict_result["raw_requirements"]),
+            len(dict_result["raw_sessions"]),
+            len(dict_result["raw_members"]),
         )
+        return dict_result
 
-    def transform(self) -> None:
-        if self._raw_inquiries.empty and not self._raw.empty:
-            # Legacy compatibility for tests/callers that pre-fill self._raw.
-            self._raw_inquiries = self._raw
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        raw_inquiries = data.get("raw_inquiries", pd.DataFrame())
+        raw = data.get("raw", pd.DataFrame())
+        raw_requirements = data.get("raw_requirements", pd.DataFrame())
+        dict_result = {}
+        if raw_inquiries.empty and not raw.empty:
+            # Legacy compatibility for tests/callers that pre-fill raw.
+            raw_inquiries = raw
 
-        if self._raw_inquiries.empty:
+        if raw_inquiries.empty:
             return
 
-        self._transform_inquiries()
-        self._transform_members()
-        self._transform_requirements()
-        self._transform_sessions()
-        self._transform_source_documents()
+        dict_result, inquiry_date_lookup = self._transform_inquiries(raw_inquiries)
+        dict_result.update(self._transform_members(data, dict_result["cpis"]))
+        dict_result.update(self._transform_requirements(raw_requirements, inquiry_date_lookup))
+        dict_result.update(self._transform_sessions(data.get("raw_sessions", pd.DataFrame()), inquiry_date_lookup))
+        dict_result.update(self._transform_source_documents(data.get("raw_history_sources", pd.DataFrame())))
+        return dict_result
 
     def _get_inquiry_value(self, row: pd.Series, *keys: str) -> str:
         for key in keys:
@@ -203,11 +186,13 @@ class SenadoCpisPipeline(Pipeline):
                 return value
         return ""
 
-    def _transform_inquiries(self) -> None:
+    def _transform_inquiries(self, raw_inquiries: pd.DataFrame) -> tuple[dict[str, list[dict[str, Any]]], dict[str, tuple[str, str]]]:
         inquiries: list[dict[str, Any]] = []
         cpis: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        inquiry_date_lookup: dict[str, tuple[str, str]]
 
-        for _, row in self._raw_inquiries.iterrows():
+        for _, row in raw_inquiries.iterrows():
             code = self._get_inquiry_value(row, "inquiry_code", "codigo", "codigo_cpi")
             name = self._get_inquiry_value(row, "name", "nome", "nome_cpi")
             if not name:
@@ -263,21 +248,25 @@ class SenadoCpisPipeline(Pipeline):
                 "house": house,
             })
 
-        self.inquiries = deduplicate_rows(inquiries, ["inquiry_id"])
-        self.cpis = deduplicate_rows(cpis, ["cpi_id"])
-        self._inquiry_date_lookup = {
+        dict_result["inquiries"] = deduplicate_rows(inquiries, ["inquiry_id"])
+        dict_result["cpis"] = deduplicate_rows(cpis, ["cpi_id"])
+        inquiry_date_lookup = {
             str(row.get("inquiry_id", "")): (
                 str(row.get("date_start", "")).strip(),
                 str(row.get("date_end", "")).strip(),
             )
-            for row in self.inquiries
+            for row in dict_result["inquiries"]
         }
 
-    def _transform_members(self) -> None:
-        rows: list[dict[str, Any]] = []
+        return dict_result, inquiry_date_lookup
 
+    def _transform_members(self, data: dict[str, pd.DataFrame], cpis: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        rows: list[dict[str, Any]] = []
+        raw_members = data.get("raw_members", pd.DataFrame())
+        raw_inquiries = data.get("raw_inquiries", pd.DataFrame())
+        dict_result: dict[str, list[dict[str, Any]]]
         # Legacy fallback: member info embedded in cpis.csv row.
-        source = self._raw_members if not self._raw_members.empty else self._raw_inquiries
+        source = raw_members if not raw_members.empty else raw_inquiries
 
         for _, row in source.iterrows():
             inquiry_id = self._get_inquiry_value(row, "inquiry_id")
@@ -302,30 +291,34 @@ class SenadoCpisPipeline(Pipeline):
                 "role": role,
             })
 
-        self.inquiry_member_rels = rows
+        cpi_lookup = {c["inquiry_id"]: c["cpi_id"] for c in cpis}
+        
+        dict_result = {
+            "inquiry_member_rels": rows,
+            "senator_rels": [
+                {
+                    "senator_name": r["person_name"],
+                    "cpi_id": cpi_lookup.get(r["inquiry_id"], ""),
+                    "role": r["role"],
+                }
+                for r in rows
+                if cpi_lookup.get(r["inquiry_id"])
+            ]
+        }
+        return dict_result
 
-        cpi_lookup = {c["inquiry_id"]: c["cpi_id"] for c in self.cpis}
-        self.senator_rels = [
-            {
-                "senator_name": r["person_name"],
-                "cpi_id": cpi_lookup.get(r["inquiry_id"], ""),
-                "role": r["role"],
-            }
-            for r in rows
-            if cpi_lookup.get(r["inquiry_id"])
-        ]
-
-    def _transform_requirements(self) -> None:
-        if self._raw_requirements.empty:
-            return
+    def _transform_requirements(self, raw_requirements: pd.DataFrame, inquiry_date_lookup: dict[str, tuple[str, str]]) -> dict[str, list[dict[str, Any]]]:
+        if raw_requirements.empty:
+            return {}
 
         requirements: list[dict[str, Any]] = []
         inquiry_rels: list[dict[str, Any]] = []
         author_cpf_rels: list[dict[str, Any]] = []
         author_name_rels: list[dict[str, Any]] = []
         mentions: list[dict[str, Any]] = []
-
-        for _, row in self._raw_requirements.iterrows():
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        temporal_violations: list[dict[str, Any]] = []
+        for _, row in raw_requirements.iterrows():
             inquiry_id = self._get_inquiry_value(row, "inquiry_id")
             if not inquiry_id:
                 continue
@@ -358,7 +351,7 @@ class SenadoCpisPipeline(Pipeline):
                 "date_precision": date_precision,
                 "run_id": self.run_id,
             })
-            start_date, end_date = self._inquiry_date_lookup.get(inquiry_id, ("", ""))
+            start_date, end_date = inquiry_date_lookup.get(inquiry_id, ("", ""))
             temporal_status = _temporal_status(date, start_date, end_date)
 
             inquiry_rels.append({
@@ -369,7 +362,7 @@ class SenadoCpisPipeline(Pipeline):
                 "temporal_rule": _TEMPORAL_RULE,
             })
             if temporal_status == "invalid":
-                self.temporal_violations.append({
+                temporal_violations.append({
                     "violation_id": _stable_id("req", inquiry_id, requirement_id, date),
                     "edge_type": "TEM_REQUERIMENTO",
                     "rule": _TEMPORAL_RULE,
@@ -412,23 +405,27 @@ class SenadoCpisPipeline(Pipeline):
                     "run_id": self.run_id,
                 })
 
-        self.inquiry_requirements = deduplicate_rows(requirements, ["requirement_id"])
-        self.inquiry_requirement_rels = inquiry_rels
-        self.requirement_author_cpf_rels = author_cpf_rels
-        self.requirement_author_name_rels = author_name_rels
-        self.requirement_company_mentions = deduplicate_rows(
-            mentions,
-            ["cnpj", "target_key", "method"],
-        )
+        return {
+            "inquiry_requirements": deduplicate_rows(requirements, ["requirement_id"]),
+            "inquiry_requirement_rels": inquiry_rels,
+            "requirement_author_cpf_rels": author_cpf_rels,
+            "requirement_author_name_rels": author_name_rels,
+            "requirement_company_mentions": deduplicate_rows(
+                mentions,
+                ["cnpj", "target_key", "method"],
+            ),
+            "temporal_violations": deduplicate_rows(temporal_violations, ["violation_id"]),
+        }
 
-    def _transform_sessions(self) -> None:
-        if self._raw_sessions.empty:
+    def _transform_sessions(self, raw_sessions: pd.DataFrame, inquiry_date_lookup: dict[str, tuple[str, str]]) -> dict[str, list[dict[str, Any]]]:
+        if raw_sessions.empty:
             return
 
         sessions: list[dict[str, Any]] = []
         session_rels: list[dict[str, Any]] = []
+        temporal_violations: list[dict[str, Any]] = []
 
-        for _, row in self._raw_sessions.iterrows():
+        for _, row in raw_sessions.iterrows():
             inquiry_id = self._get_inquiry_value(row, "inquiry_id")
             if not inquiry_id:
                 continue
@@ -457,7 +454,7 @@ class SenadoCpisPipeline(Pipeline):
                 "date_precision": date_precision,
                 "run_id": self.run_id,
             })
-            start_date, end_date = self._inquiry_date_lookup.get(inquiry_id, ("", ""))
+            start_date, end_date = inquiry_date_lookup.get(inquiry_id, ("", ""))
             temporal_status = _temporal_status(date, start_date, end_date)
 
             session_rels.append({
@@ -468,7 +465,7 @@ class SenadoCpisPipeline(Pipeline):
                 "temporal_rule": _TEMPORAL_RULE,
             })
             if temporal_status == "invalid":
-                self.temporal_violations.append({
+                temporal_violations.append({
                     "violation_id": _stable_id("sess", inquiry_id, session_id, date),
                     "edge_type": "REALIZOU_SESSAO",
                     "rule": _TEMPORAL_RULE,
@@ -478,16 +475,18 @@ class SenadoCpisPipeline(Pipeline):
                     "source_id": self.source_id,
                     "run_id": self.run_id,
                 })
+        return {
+            "inquiry_sessions": deduplicate_rows(sessions, ["session_id"]),
+            "inquiry_session_rels": session_rels,
+            "temporal_violations": deduplicate_rows(temporal_violations, ["violation_id"]),
+        }
 
-        self.inquiry_sessions = deduplicate_rows(sessions, ["session_id"])
-        self.inquiry_session_rels = session_rels
-
-    def _transform_source_documents(self) -> None:
-        if self._raw_history_sources.empty:
-            return
+    def _transform_source_documents(self, raw_history_sources: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+        if raw_history_sources.empty:
+            return {"source_documents": []}
 
         documents: list[dict[str, Any]] = []
-        for _, row in self._raw_history_sources.iterrows():
+        for _, row in raw_history_sources.iterrows():
             url = self._get_inquiry_value(row, "source_url", "url")
             checksum = self._get_inquiry_value(row, "checksum")
             if not url:
@@ -503,24 +502,38 @@ class SenadoCpisPipeline(Pipeline):
                 "source_id": self.source_id,
                 "run_id": self.run_id,
             })
+        return {
+            "source_documents": deduplicate_rows(documents, ["doc_id"]),
+        }
 
-        self.source_documents = deduplicate_rows(documents, ["doc_id"])
-
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
+        inquiries = data.get("inquiries", [])
+        cpis = data.get("cpis", [])
+        inquiry_requirements = data.get("inquiry_requirements", [])
+        inquiry_sessions = data.get("inquiry_sessions", [])
+        inquiry_requirement_rels = data.get("inquiry_requirement_rels", [])
+        inquiry_session_rels = data.get("inquiry_session_rels", [])
+        inquiry_member_rels = data.get("inquiry_member_rels", [])
+        senator_rels = data.get("senator_rels", [])
+        requirement_author_cpf_rels = data.get("requirement_author_cpf_rels", [])
+        requirement_author_name_rels = data.get("requirement_author_name_rels", [])
+        requirement_company_mentions = data.get("requirement_company_mentions", []) 
+        source_documents = data.get("source_documents", [])
+        temporal_violations = data.get("temporal_violations", [])
 
-        if self.inquiries:
-            count = loader.load_nodes("Inquiry", self.inquiries, key_field="inquiry_id")
+        if inquiries:
+            count = loader.load_nodes("Inquiry", inquiries, key_field="inquiry_id")
             logger.info("[senado_cpis] loaded %d Inquiry nodes", count)
 
-        if self.cpis:
-            count = loader.load_nodes("CPI", self.cpis, key_field="cpi_id")
+        if cpis:
+            count = loader.load_nodes("CPI", cpis, key_field="cpi_id")
             logger.info("[senado_cpis] loaded %d CPI nodes", count)
 
             # Explicit compatibility bridge between old and new labels.
             bridge_rows = [
                 {"source_key": row["cpi_id"], "target_key": row["inquiry_id"]}
-                for row in self.cpis
+                for row in cpis
                 if row.get("inquiry_id")
             ]
             if bridge_rows:
@@ -533,26 +546,26 @@ class SenadoCpisPipeline(Pipeline):
                     target_key="inquiry_id",
                 )
 
-        if self.inquiry_requirements:
+        if inquiry_requirements:
             count = loader.load_nodes(
                 "InquiryRequirement",
-                self.inquiry_requirements,
+                inquiry_requirements,
                 key_field="requirement_id",
             )
             logger.info("[senado_cpis] loaded %d InquiryRequirement nodes", count)
 
-        if self.inquiry_sessions:
+        if inquiry_sessions:
             count = loader.load_nodes(
                 "InquirySession",
-                self.inquiry_sessions,
+                inquiry_sessions,
                 key_field="session_id",
             )
             logger.info("[senado_cpis] loaded %d InquirySession nodes", count)
 
-        if self.inquiry_requirement_rels:
+        if inquiry_requirement_rels:
             loader.load_relationships(
                 rel_type="TEM_REQUERIMENTO",
-                rows=self.inquiry_requirement_rels,
+                rows=inquiry_requirement_rels,
                 source_label="Inquiry",
                 source_key="inquiry_id",
                 target_label="InquiryRequirement",
@@ -560,10 +573,10 @@ class SenadoCpisPipeline(Pipeline):
                 properties=["event_date", "temporal_status", "temporal_rule"],
             )
 
-        if self.inquiry_session_rels:
+        if inquiry_session_rels:
             loader.load_relationships(
                 rel_type="REALIZOU_SESSAO",
-                rows=self.inquiry_session_rels,
+                rows=inquiry_session_rels,
                 source_label="Inquiry",
                 source_key="inquiry_id",
                 target_label="InquirySession",
@@ -571,7 +584,7 @@ class SenadoCpisPipeline(Pipeline):
                 properties=["event_date", "temporal_status", "temporal_rule"],
             )
 
-        if self.inquiry_member_rels:
+        if inquiry_member_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person) WHERE p.name = row.person_name "
@@ -579,9 +592,9 @@ class SenadoCpisPipeline(Pipeline):
                 "MERGE (p)-[r:PARTICIPA_INQUIRY]->(i) "
                 "SET r.role = row.role"
             )
-            loader.run_query_with_retry(query, self.inquiry_member_rels)
+            loader.run_query_with_retry(query, inquiry_member_rels)
 
-        if self.senator_rels:
+        if senator_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person) WHERE p.name = row.senator_name "
@@ -589,35 +602,35 @@ class SenadoCpisPipeline(Pipeline):
                 "MERGE (p)-[r:PARTICIPOU_CPI]->(c) "
                 "SET r.role = row.role"
             )
-            loader.run_query_with_retry(query, self.senator_rels)
+            loader.run_query_with_retry(query, senator_rels)
 
-        if self.requirement_author_cpf_rels:
+        if requirement_author_cpf_rels:
             loader.load_relationships(
                 rel_type="PROPOS_REQUERIMENTO",
-                rows=self.requirement_author_cpf_rels,
+                rows=requirement_author_cpf_rels,
                 source_label="Person",
                 source_key="cpf",
                 target_label="InquiryRequirement",
                 target_key="requirement_id",
             )
 
-        if self.requirement_author_name_rels:
+        if requirement_author_name_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person) WHERE p.name = row.person_name "
                 "MATCH (r:InquiryRequirement {requirement_id: row.target_key}) "
                 "MERGE (p)-[:PROPOS_REQUERIMENTO]->(r)"
             )
-            loader.run_query_with_retry(query, self.requirement_author_name_rels)
+            loader.run_query_with_retry(query, requirement_author_name_rels)
 
-        if self.requirement_company_mentions:
+        if requirement_company_mentions:
             companies = deduplicate_rows(
                 [
                     {
                         "cnpj": row["cnpj"],
                         "razao_social": row.get("cnpj", ""),
                     }
-                    for row in self.requirement_company_mentions
+                    for row in requirement_company_mentions
                 ],
                 ["cnpj"],
             )
@@ -633,20 +646,20 @@ class SenadoCpisPipeline(Pipeline):
                 "m.source_ref = row.source_ref, "
                 "m.run_id = row.run_id"
             )
-            loader.run_query_with_retry(query, self.requirement_company_mentions)
+            loader.run_query_with_retry(query, requirement_company_mentions)
 
-        if self.temporal_violations:
+        if temporal_violations:
             count = loader.load_nodes(
                 "TemporalViolation",
-                deduplicate_rows(self.temporal_violations, ["violation_id"]),
+                deduplicate_rows(temporal_violations, ["violation_id"]),
                 key_field="violation_id",
             )
             logger.info("[senado_cpis] loaded %d TemporalViolation nodes", count)
 
-        if self.source_documents:
+        if source_documents:
             count = loader.load_nodes(
                 "SourceDocument",
-                self.source_documents,
+                source_documents,
                 key_field="doc_id",
             )
             logger.info("[senado_cpis] loaded %d SourceDocument nodes", count)

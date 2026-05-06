@@ -80,47 +80,48 @@ class TransparenciaPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_contratos: pd.DataFrame = pd.DataFrame()
-        self._raw_servidores: pd.DataFrame = pd.DataFrame()
-        self._raw_emendas: pd.DataFrame = pd.DataFrame()
-        self.contracts: list[dict[str, Any]] = []
-        self.offices: list[dict[str, Any]] = []
-        self.amendments: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         src_dir = Path(self.data_dir) / "transparencia"
+        dict_result: dict[str, pd.DataFrame] = {}
         if not src_dir.exists():
             logger.warning("[%s] Data directory not found: %s", self.name, src_dir)
-            return
+            return {}
         contratos_path = src_dir / "contratos.csv"
         servidores_path = src_dir / "servidores.csv"
         emendas_path = src_dir / "emendas.csv"
         if not contratos_path.exists():
             logger.warning("[%s] contratos.csv not found in %s", self.name, src_dir)
         else:
-            self._raw_contratos = pd.read_csv(
+            dict_result["raw_contratos"] = pd.read_csv(
                 contratos_path, dtype=str, keep_default_na=False, encoding="utf-8",
             )
         if not servidores_path.exists():
             logger.warning("[%s] servidores.csv not found in %s", self.name, src_dir)
         else:
-            self._raw_servidores = pd.read_csv(
+            dict_result["raw_servidores"] = pd.read_csv(
                 servidores_path, dtype=str, keep_default_na=False, encoding="utf-8",
             )
         if not emendas_path.exists():
             logger.warning("[%s] emendas.csv not found in %s", self.name, src_dir)
         else:
-            self._raw_emendas = pd.read_csv(
+            dict_result["raw_emendas"] = pd.read_csv(
                 emendas_path, dtype=str, keep_default_na=False, encoding="utf-8",
             )
 
-    def transform(self) -> None:
+        return dict_result
+
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        raw_contratos = data.get("raw_contratos")
+        raw_servidores = data.get("raw_servidores")
+        raw_emendas = data.get("raw_emendas")
+        dict_result: dict[str, list[dict[str, Any]]] = {}
         contracts: list[dict[str, Any]] = []
-        for _, row in self._raw_contratos.iterrows():
+
+        for _, row in raw_contratos.iterrows():
             raw_cnpj = str(row["cnpj_contratada"]).strip()
 
             # Skip classified contracts (sigiloso) — no usable CNPJ
@@ -143,10 +144,10 @@ class TransparenciaPipeline(Pipeline):
                 "cnpj": cnpj,
                 "razao_social": normalize_name(str(row["razao_social"])),
             })
-        self.contracts = deduplicate_rows(contracts, ["contract_id"])
+        dict_result["contracts"] = deduplicate_rows(contracts, ["contract_id"])
 
         offices: list[dict[str, Any]] = []
-        for _, row in self._raw_servidores.iterrows():
+        for _, row in raw_servidores.iterrows():
             raw_cpf = str(row["cpf"])
             cpf_partial = _extract_cpf_middle6(raw_cpf)
             name = normalize_name(str(row["nome"]))
@@ -164,10 +165,10 @@ class TransparenciaPipeline(Pipeline):
                 "org": org,
                 "salary": salary,
             })
-        self.offices = deduplicate_rows(offices, ["office_id"])
+        dict_result["offices"] = deduplicate_rows(offices, ["office_id"])
 
         amendments: list[dict[str, Any]] = []
-        for _, row in self._raw_emendas.iterrows():
+        for _, row in raw_emendas.iterrows():
             codigo = str(row.get("codigo_autor", "")).strip()
             nome = normalize_name(str(row["nome_autor"]))
             author_key = codigo if codigo else nome.replace(" ", "_")
@@ -179,12 +180,14 @@ class TransparenciaPipeline(Pipeline):
                 "object": normalize_name(str(row["objeto"])),
                 "value": _parse_brl(str(row["valor"])),
             })
-        self.amendments = deduplicate_rows(amendments, ["amendment_id"])
+        dict_result["amendments"] = deduplicate_rows(amendments, ["amendment_id"])
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=500)
+        return dict_result
 
-        if self.contracts:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
+
+        if data["contracts"]:
             loader.load_nodes(
                 "Contract",
                 [
@@ -195,13 +198,13 @@ class TransparenciaPipeline(Pipeline):
                         "contracting_org": c["contracting_org"],
                         "date": c["date"],
                     }
-                    for c in self.contracts
+                    for c in data["contracts"]
                 ],
                 key_field="contract_id",
             )
             # Ensure Company nodes exist for contracted companies
             companies = deduplicate_rows(
-                [{"cnpj": c["cnpj"], "razao_social": c["razao_social"]} for c in self.contracts],
+                [{"cnpj": c["cnpj"], "razao_social": c["razao_social"]} for c in data["contracts"]],
                 ["cnpj"],
             )
             loader.load_nodes("Company", companies, key_field="cnpj")
@@ -211,7 +214,7 @@ class TransparenciaPipeline(Pipeline):
                 rel_type="VENCEU",
                 rows=[
                     {"source_key": c["cnpj"], "target_key": c["contract_id"]}
-                    for c in self.contracts
+                    for c in data["contracts"]
                 ],
                 source_label="Company",
                 source_key="cnpj",
@@ -219,7 +222,7 @@ class TransparenciaPipeline(Pipeline):
                 target_key="contract_id",
             )
 
-        if self.offices:
+        if data["offices"]:
             # PublicOffice nodes — keyed on office_id (hash of cpf_partial+name+org)
             po_query = (
                 "UNWIND $rows AS row "
@@ -227,7 +230,7 @@ class TransparenciaPipeline(Pipeline):
                 "SET po.cpf_partial = row.cpf_partial, po.name = row.name, "
                 "po.org = row.org, po.salary = row.salary"
             )
-            loader.run_query_with_retry(po_query, self.offices)
+            loader.run_query(po_query, data["offices"])
 
             # Person nodes — keyed on servidor_id (hash of cpf_partial+name)
             # DO NOT set cpf — would conflict with uniqueness constraint
@@ -238,7 +241,7 @@ class TransparenciaPipeline(Pipeline):
                         "cpf_partial": o["cpf_partial"],
                         "name": o["name"],
                     }
-                    for o in self.offices
+                    for o in data["offices"]
                 ],
                 ["servidor_id"],
             )
@@ -248,7 +251,7 @@ class TransparenciaPipeline(Pipeline):
                 "SET p.cpf_partial = row.cpf_partial, p.name = row.name, "
                 "p.source = 'portal_transparencia'"
             )
-            loader.run_query_with_retry(person_query, persons)
+            loader.run_query(person_query, persons)
 
             # RECEBEU_SALARIO: Person -> PublicOffice
             rel_query = (
@@ -257,15 +260,15 @@ class TransparenciaPipeline(Pipeline):
                 "MATCH (po:PublicOffice {office_id: row.office_id}) "
                 "MERGE (p)-[:RECEBEU_SALARIO]->(po)"
             )
-            loader.run_query_with_retry(
+            loader.run_query(
                 rel_query,
                 [
                     {"servidor_id": o["servidor_id"], "office_id": o["office_id"]}
-                    for o in self.offices
+                    for o in data["offices"]
                 ],
             )
 
-        if self.amendments:
+        if data["amendments"]:
             # Amendment nodes — each emenda is its own entity
             loader.load_nodes(
                 "Amendment",
@@ -275,7 +278,7 @@ class TransparenciaPipeline(Pipeline):
                         "object": a["object"],
                         "value": a["value"],
                     }
-                    for a in self.amendments
+                    for a in data["amendments"]
                 ],
                 key_field="amendment_id",
             )
@@ -283,7 +286,7 @@ class TransparenciaPipeline(Pipeline):
             # Person nodes for amendment authors (keyed by author_key).
             # Entity resolution links these to TSE candidates later.
             persons = deduplicate_rows(
-                [{"name": a["name"], "author_key": a["author_key"]} for a in self.amendments],
+                [{"name": a["name"], "author_key": a["author_key"]} for a in data["amendments"]],
                 ["author_key"],
             )
             loader.load_nodes("Person", persons, key_field="author_key")
@@ -293,7 +296,7 @@ class TransparenciaPipeline(Pipeline):
                 rel_type="AUTOR_EMENDA",
                 rows=[
                     {"source_key": a["author_key"], "target_key": a["amendment_id"]}
-                    for a in self.amendments
+                    for a in data["amendments"]
                 ],
                 source_label="Person",
                 source_key="author_key",

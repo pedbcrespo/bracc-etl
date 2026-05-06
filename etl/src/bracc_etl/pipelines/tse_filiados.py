@@ -49,15 +49,12 @@ class TseFiliadosPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.memberships: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
+        raw: pd.DataFrame = pd.DataFrame()
         filiados_dir = Path(self.data_dir) / "tse_filiados"
         csv_path = filiados_dir / "filiados.csv"
 
@@ -65,21 +62,24 @@ class TseFiliadosPipeline(Pipeline):
             logger.warning("[tse_filiados] filiados.csv not found at %s", csv_path)
             return
 
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw =   raw.head(self.limit)
 
-        logger.info("[tse_filiados] Extracted %d raw rows", len(self._raw))
+        logger.info("[tse_filiados] Extracted %d raw rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         memberships: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-        for _idx, row in self._raw.iterrows():
+        for _idx, row in data.iterrows():
             nome_raw = str(row.get("nome", "")).strip()
             if not nome_raw:
                 continue
@@ -123,25 +123,30 @@ class TseFiliadosPipeline(Pipeline):
                 "status": status,
             })
 
-        self.memberships = deduplicate_rows(memberships, ["membership_id"])
-        self.person_rels = person_rels
+        dict_result = {
+            "memberships": deduplicate_rows(memberships, ["membership_id"]),
+            "person_rels": person_rels,
+        }
 
         logger.info(
             "[tse_filiados] Transformed %d PartyMembership nodes, %d person relationships",
-            len(self.memberships),
-            len(self.person_rels),
+            len(dict_result["memberships"]),
+            len(dict_result["person_rels"]),
         )
 
-    def load(self) -> None:
+        return dict_result
+
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.memberships:
+        if data["memberships"]:
             loaded = loader.load_nodes(
-                "PartyMembership", self.memberships, key_field="membership_id",
+                "PartyMembership", data["memberships"], key_field="membership_id",
             )
             logger.info("[tse_filiados] Loaded %d PartyMembership nodes", loaded)
 
-        if not self.person_rels:
+        if not data["person_rels"]:
+            logger.info("[tse_filiados] No person relationships to load")
             return
 
         # Tiered matching: try narrower criteria first, then fall back.
@@ -152,9 +157,9 @@ class TseFiliadosPipeline(Pipeline):
 
         tier_high: list[dict[str, Any]] = []    # name + UF + birth_date
         tier_medium: list[dict[str, Any]] = []   # name + UF + municipality
-        all_rels = self.person_rels  # ALL go through low tier as fallback
+        all_rels = data["person_rels"]  # ALL go through low tier as fallback
 
-        for rel in self.person_rels:
+        for rel in data["person_rels"]:
             has_birth = bool(rel["source_birth_date"])
             has_muni = bool(rel["source_municipality_id"])
             if has_birth:

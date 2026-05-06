@@ -62,23 +62,21 @@ class OfacPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.sanctions: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         ofac_dir = Path(self.data_dir) / "ofac"
         csv_path = ofac_dir / "sdn.csv"
+        raw: pd.DataFrame = pd.DataFrame()
 
         if not csv_path.exists():
             logger.warning("[ofac] sdn.csv not found at %s", csv_path)
             return
 
         logger.info("[ofac] Reading %s", csv_path)
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             header=None,
             names=SDN_COLUMNS,
@@ -86,17 +84,19 @@ class OfacPipeline(Pipeline):
             encoding="utf-8",
             keep_default_na=False,
             on_bad_lines="skip",
+            chunksize=self.chunk_size
         )
 
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw = raw.head(self.limit)
 
-        logger.info("[ofac] Extracted %d rows", len(self._raw))
+        logger.info("[ofac] Extracted %d rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> list[dict[str, Any]]:
         sanctions: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             ent_num = str(row["ent_num"]).strip()
             if not ent_num:
                 continue
@@ -120,18 +120,19 @@ class OfacPipeline(Pipeline):
                 "source": "ofac_sdn",
             })
 
-        self.sanctions = deduplicate_rows(sanctions, ["sanction_id"])
+        sanctions = deduplicate_rows(sanctions, ["sanction_id"])
 
         logger.info(
             "[ofac] Transformed %d InternationalSanction nodes",
-            len(self.sanctions),
+            len(sanctions),
         )
+        return sanctions
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, sanctions: list[dict[str, Any]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.sanctions:
+        if sanctions:
             loaded = loader.load_nodes(
-                "InternationalSanction", self.sanctions, key_field="sanction_id"
+                "InternationalSanction", sanctions, key_field="sanction_id"
             )
             logger.info("[ofac] Loaded %d InternationalSanction nodes", loaded)

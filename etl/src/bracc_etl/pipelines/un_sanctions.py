@@ -43,38 +43,35 @@ class UnSanctionsPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: list[dict[str, Any]] = []
-        self.sanctions: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, Any]]:
         un_dir = Path(self.data_dir) / "un_sanctions"
         json_path = un_dir / "un_sanctions.json"
-
+        raw: list[dict[str, Any]] = []
         if not json_path.exists():
             logger.warning("[un_sanctions] un_sanctions.json not found at %s", json_path)
             return
 
         logger.info("[un_sanctions] Reading %s", json_path)
         with open(json_path, encoding="utf-8") as f:
-            self._raw = json.load(f)
+            raw = json.load(f)
 
         if self.limit:
-            self._raw = self._raw[: self.limit]
+            raw = raw[: self.limit]
 
-        logger.info("[un_sanctions] Extracted %d entries", len(self._raw))
+        logger.info("[un_sanctions] Extracted %d entries", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         sanctions: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
+        dict_results: dict[str, list[dict[str, Any]]] = {}
 
-        for entry in self._raw:
+        for entry in data:
             reference_number = str(entry.get("reference_number", "")).strip()
             if not reference_number:
                 continue
@@ -121,31 +118,32 @@ class UnSanctionsPipeline(Pipeline):
                     "target_key": name_normalized,
                 })
 
-        self.sanctions = deduplicate_rows(sanctions, ["sanction_id"])
+        dict_results["sanctions"] = deduplicate_rows(sanctions, ["sanction_id"])
 
         # Filter rels to only include sanctions that survived dedup
-        valid_ids = {s["sanction_id"] for s in self.sanctions}
-        self.person_rels = [r for r in person_rels if r["source_key"] in valid_ids]
-        self.company_rels = [r for r in company_rels if r["source_key"] in valid_ids]
+        valid_ids = {s["sanction_id"] for s in dict_results["sanctions"]}
+        dict_results["person_rels"] = [r for r in person_rels if r["source_key"] in valid_ids]
+        dict_results["company_rels"] = [r for r in company_rels if r["source_key"] in valid_ids]
 
         logger.info(
             "[un_sanctions] Transformed %d InternationalSanction nodes "
             "(%d person matches, %d company matches)",
-            len(self.sanctions),
-            len(self.person_rels),
-            len(self.company_rels),
+            len(dict_results["sanctions"]),
+            len(dict_results["person_rels"]),
+            len(dict_results["company_rels"]),
         )
+        return dict_results
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.sanctions:
+        if data["sanctions"]:
             loaded = loader.load_nodes(
-                "InternationalSanction", self.sanctions, key_field="sanction_id"
+                "InternationalSanction", data["sanctions"], key_field="sanction_id"
             )
             logger.info("[un_sanctions] Loaded %d InternationalSanction nodes", loaded)
 
-        if self.person_rels:
+        if data["person_rels"]:
             person_query = (
                 "UNWIND $rows AS row "
                 "MATCH (s:InternationalSanction {sanction_id: row.source_key}) "
@@ -153,10 +151,10 @@ class UnSanctionsPipeline(Pipeline):
                 "MERGE (p)-[r:UN_SANCTIONED]->(s) "
                 "SET r.matched_by = 'name'"
             )
-            loaded = loader.run_query_with_retry(person_query, self.person_rels)
+            loaded = loader.run_query_with_retry(person_query, data["person_rels"])
             logger.info("[un_sanctions] Created %d Person UN_SANCTIONED rels", loaded)
 
-        if self.company_rels:
+        if data["company_rels"]:
             company_query = (
                 "UNWIND $rows AS row "
                 "MATCH (s:InternationalSanction {sanction_id: row.source_key}) "
@@ -164,5 +162,5 @@ class UnSanctionsPipeline(Pipeline):
                 "MERGE (c)-[r:UN_SANCTIONED]->(s) "
                 "SET r.matched_by = 'name'"
             )
-            loaded = loader.run_query_with_retry(company_query, self.company_rels)
+            loaded = loader.run_query_with_retry(company_query, data["company_rels"])
             logger.info("[un_sanctions] Created %d Company UN_SANCTIONED rels", loaded)

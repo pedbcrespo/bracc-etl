@@ -83,35 +83,36 @@ class PepCguPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.pep_records: list[dict[str, Any]] = []
-        self.person_links: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         pep_dir = Path(self.data_dir) / "pep_cgu"
         csv_path = pep_dir / "pep.csv"
+        raw: pd.DataFrame = pd.DataFrame()
         if not csv_path.exists():
             msg = f"PEP CSV not found: {csv_path}"
             raise FileNotFoundError(msg)
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             delimiter=";",
             encoding="latin-1",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
-        self._raw = _normalize_columns(self._raw)
-        logger.info("[pep_cgu] Extracted %d PEP records", len(self._raw))
+        raw = _normalize_columns(raw)
+        logger.info("[pep_cgu] Extracted %d PEP records", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         records: list[dict[str, Any]] = []
         links: list[dict[str, Any]] = []
+        pep_records: list[dict[str, Any]] = []
+        person_links: list[dict[str, Any]] = []
 
-        for idx, row in self._raw.iterrows():
+        for idx, row in data.iterrows():
             cpf_raw = str(row.get("CPF", "")).strip()
             digits = strip_document(cpf_raw)
 
@@ -156,22 +157,26 @@ class PepCguPipeline(Pipeline):
             if self.limit and len(records) >= self.limit:
                 break
 
-        self.pep_records = deduplicate_rows(records, ["pep_id"])
-        self.person_links = links
+        pep_records = deduplicate_rows(records, ["pep_id"])
+        person_links = links
         logger.info(
             "[pep_cgu] Transformed %d PEP records, %d person links",
-            len(self.pep_records),
-            len(self.person_links),
+            len(pep_records),
+            len(person_links),
         )
+        return {
+            "pep_records": pep_records,
+            "person_links": person_links,
+        }
 
-    def load(self) -> None:
+    def load(self, data:dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.pep_records:
-            loaded = loader.load_nodes("PEPRecord", self.pep_records, key_field="pep_id")
+        if data["pep_records"]:
+            loaded = loader.load_nodes("PEPRecord", data["pep_records"], key_field="pep_id")
             logger.info("[pep_cgu] Loaded %d PEPRecord nodes", loaded)
 
-        if self.person_links:
+        if data["person_links"]:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (p:Person {cpf: row.source_key}) "
@@ -180,5 +185,5 @@ class PepCguPipeline(Pipeline):
                 "MATCH (pep:PEPRecord {pep_id: row.target_key}) "
                 "MERGE (p)-[:PEP_REGISTRADA]->(pep)"
             )
-            loaded = loader.run_query_with_retry(query, self.person_links)
+            loaded = loader.run_query_with_retry(query, data["person_links"])
             logger.info("[pep_cgu] Loaded %d PEP_REGISTRADA relationships", loaded)

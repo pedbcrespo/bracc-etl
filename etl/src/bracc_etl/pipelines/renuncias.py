@@ -46,18 +46,17 @@ class RenunciasPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self._raw: pd.DataFrame = pd.DataFrame()
         self.waivers: list[dict[str, Any]] = []
         self.company_rels: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         data_dir = Path(self.data_dir) / "renuncias"
         frames: list[pd.DataFrame] = []
-
+        raw: pd.DataFrame = pd.DataFrame()
         # Only process RenúnciasFiscais files (have amounts); skip
         # EmpresasHabilitadas and EmpresasImunesOuIsentas (no values).
         for csv_file in sorted(data_dir.glob("*.csv")):
@@ -74,20 +73,21 @@ class RenunciasPipeline(Pipeline):
             frames.append(df)
 
         if frames:
-            self._raw = pd.concat(frames, ignore_index=True)
+            raw = pd.concat(frames, ignore_index=True)
         else:
-            self._raw = pd.DataFrame()
+            raw = pd.DataFrame()
 
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw = raw.head(self.limit)
 
-        logger.info("Extracted %d renuncias records", len(self._raw))
-
-    def transform(self) -> None:
+        logger.info("Extracted %d renuncias records", len(raw))
+        return raw
+    
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         waivers: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             cnpj_raw = str(row.get("CNPJ", "")).strip().strip('"')
             digits = strip_document(cnpj_raw)
 
@@ -136,21 +136,25 @@ class RenunciasPipeline(Pipeline):
                 "company_name": name,
             })
 
-        self.waivers = deduplicate_rows(waivers, ["waiver_id"])
-        self.company_rels = company_rels
+        waivers = deduplicate_rows(waivers, ["waiver_id"])
+        company_rels = company_rels
         logger.info(
             "Transformed %d waivers, %d company links",
-            len(self.waivers),
-            len(self.company_rels),
+            len(waivers),
+            len(company_rels),
         )
+        return {
+            "waivers": waivers,
+            "company_rels": company_rels,
+        }
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.waivers:
-            loader.load_nodes("TaxWaiver", self.waivers, key_field="waiver_id")
+        if data["waivers"]:
+            loader.load_nodes("TaxWaiver", data["waivers"], key_field="waiver_id")
 
-        if self.company_rels:
+        if data["company_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (c:Company {cnpj: row.cnpj}) "
@@ -159,4 +163,4 @@ class RenunciasPipeline(Pipeline):
                 "MATCH (w:TaxWaiver {waiver_id: row.waiver_id}) "
                 "MERGE (c)-[:RECEBEU_RENUNCIA]->(w)"
             )
-            loader.run_query_with_retry(query, self.company_rels)
+            loader.run_query_with_retry(query, data["company_rels"])

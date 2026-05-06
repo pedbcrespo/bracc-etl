@@ -30,28 +30,25 @@ class LeniencyPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.agreements: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         leniency_dir = Path(self.data_dir) / "leniency"
-        self._raw = pd.read_csv(
+        return pd.read_csv(
             leniency_dir / "leniencia.csv",
             dtype=str,
             encoding="latin-1",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         agreements: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
 
-        for _idx, row in self._raw.iterrows():
+        for _idx, row in data.iterrows():
             cnpj_raw = str(row.get("cnpj", ""))
             digits = strip_document(cnpj_raw)
 
@@ -88,19 +85,21 @@ class LeniencyPipeline(Pipeline):
                 "company_name": nome,
             })
 
-        self.agreements = deduplicate_rows(agreements, ["leniency_id"])
-        self.company_rels = company_rels
+        return {
+            "agreements": deduplicate_rows(agreements, ["leniency_id"]),
+            "company_rels": company_rels,
+        }
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.agreements:
+        if data["agreements"]:
             loader.load_nodes(
-                "LeniencyAgreement", self.agreements, key_field="leniency_id",
+                "LeniencyAgreement", data["agreements"], key_field="leniency_id",
             )
 
         # Ensure Company nodes exist
-        for rel in self.company_rels:
+        for rel in data["company_rels"]:
             loader.load_nodes(
                 "Company",
                 [{
@@ -111,11 +110,11 @@ class LeniencyPipeline(Pipeline):
                 key_field="cnpj",
             )
 
-        if self.company_rels:
+        if data["company_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (c:Company {cnpj: row.source_key}) "
                 "MATCH (l:LeniencyAgreement {leniency_id: row.target_key}) "
                 "MERGE (c)-[:FIRMOU_LENIENCIA]->(l)"
             )
-            loader.run_query_with_retry(query, self.company_rels)
+            loader.run_query_with_retry(query, data["company_rels"])

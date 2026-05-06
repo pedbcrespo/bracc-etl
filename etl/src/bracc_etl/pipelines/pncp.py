@@ -67,12 +67,9 @@ class PncpPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_records: list[dict[str, Any]] = []
-        self.bids: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self.coverage_start: str = ""
         self.coverage_end: str = ""
         self.coverage_complete: bool = False
@@ -126,7 +123,7 @@ class PncpPipeline(Pipeline):
             self.coverage_end = f"{last_month}-31"
             self.coverage_complete = False
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, Any]]:
         """Load pre-downloaded PNCP JSON files from data/pncp/."""
         src_dir = Path(self.data_dir) / "pncp"
         json_files = sorted(src_dir.glob("pncp_*.json"))
@@ -134,7 +131,7 @@ class PncpPipeline(Pipeline):
             logger.warning("No PNCP JSON files found in %s", src_dir)
             return
 
-        all_records: list[dict[str, Any]] = []
+        raw_records: list[dict[str, Any]] = []
         for f in json_files:
             try:
                 raw = f.read_text(encoding="utf-8")
@@ -152,29 +149,29 @@ class PncpPipeline(Pipeline):
                 logger.warning("Unexpected format in %s, skipping", f.name)
                 continue
 
-            all_records.extend(records)
+            raw_records.extend(records)
             logger.info("  Loaded %d records from %s", len(records), f.name)
 
-        logger.info("Total raw records: %d", len(all_records))
-        self._raw_records = all_records
-        self._infer_coverage(src_dir, json_files, all_records)
+        logger.info("Total raw records: %d", len(raw_records))
+        self._infer_coverage(src_dir, json_files, raw_records)
         logger.info(
             "PNCP coverage window: start=%s end=%s complete=%s",
             self.coverage_start or "unknown",
             self.coverage_end or "unknown",
             self.coverage_complete,
         )
+        return raw_records
 
-    def transform(self) -> None:
+    def transform(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Normalize fields, format CNPJs, deduplicate by bid_id."""
-        if not self._raw_records:
-            return
+        if not data:
+            return []
 
         bids: list[dict[str, Any]] = []
         skipped_no_cnpj = 0
         skipped_zero_value = 0
 
-        for rec in self._raw_records:
+        for rec in data:
             # Extract agency CNPJ
             org = rec.get("orgaoEntidade") or {}
             cnpj_raw = str(org.get("cnpj", "")).strip()
@@ -250,25 +247,26 @@ class PncpPipeline(Pipeline):
                 "coverage_complete": self.coverage_complete,
             })
 
-        self.bids = deduplicate_rows(bids, ["bid_id"])
+        bids = deduplicate_rows(bids, ["bid_id"])
 
         logger.info(
             "Transformed: %d bids (skipped %d no-CNPJ, %d zero-value)",
-            len(self.bids),
+            len(bids),
             skipped_no_cnpj,
             skipped_zero_value,
         )
 
         if self.limit:
-            self.bids = self.bids[: self.limit]
+            bids = bids[: self.limit]
+        return bids
 
-    def load(self) -> None:
+    def load(self, bids: list[dict[str, Any]]) -> None:
         """Load Bid nodes and LICITOU relationships into Neo4j."""
-        if not self.bids:
+        if not bids:
             logger.warning("No bids to load")
             return
 
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+        loader = Neo4jBatchLoader(self.driver)
 
         # Load Bid nodes (MERGE on bid_id)
         bid_nodes = [
@@ -290,7 +288,7 @@ class PncpPipeline(Pipeline):
                 "coverage_end": b["coverage_end"],
                 "coverage_complete": b["coverage_complete"],
             }
-            for b in self.bids
+            for b in bids
         ]
         count = loader.load_nodes("Bid", bid_nodes, key_field="bid_id")
         logger.info("Loaded %d Bid nodes", count)
@@ -299,7 +297,7 @@ class PncpPipeline(Pipeline):
         agencies = deduplicate_rows(
             [
                 {"cnpj": b["agency_cnpj"], "razao_social": b["agency_name"]}
-                for b in self.bids
+                for b in bids
             ],
             ["cnpj"],
         )
@@ -309,7 +307,7 @@ class PncpPipeline(Pipeline):
         # LICITOU: Company (agency) -> Bid
         rels = [
             {"source_key": b["agency_cnpj"], "target_key": b["bid_id"]}
-            for b in self.bids
+            for b in bids
         ]
         count = loader.load_relationships(
             rel_type="LICITOU",

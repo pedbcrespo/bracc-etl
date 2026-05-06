@@ -44,13 +44,12 @@ class RaisPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self.labor_stats: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, Any]]:
         """Read RAIS establishment microdata and aggregate by CNAE + UF.
 
         If a pre-aggregated CSV exists, use it directly. Otherwise,
@@ -63,18 +62,17 @@ class RaisPipeline(Pipeline):
         if agg_path.exists():
             logger.info("Reading pre-aggregated RAIS data from %s", agg_path.name)
             df = pd.read_csv(agg_path, dtype=str, keep_default_na=False)
-            self._from_aggregated(df)
-            return
+            return self._from_aggregated(df)
 
         # Otherwise aggregate from raw microdata
         raw_files = sorted(rais_dir.glob("RAIS_ESTAB_PUB*.txt*"))
         if not raw_files:
             logger.warning("No RAIS data files found in %s", rais_dir)
-            return
+            return []
 
-        self._aggregate_raw(raw_files[0])
+        return self._aggregate_raw(raw_files[0])
 
-    def _from_aggregated(self, df: pd.DataFrame) -> None:
+    def _from_aggregated(self, df: pd.DataFrame) -> list[dict[str, Any]]:
         """Load from pre-aggregated CSV."""
         rows: list[dict[str, Any]] = []
         for _, row in df.iterrows():
@@ -94,10 +92,10 @@ class RaisPipeline(Pipeline):
                 "avg_employees": float(row.get("avg_employees", 0)),
                 "source": "rais_mte",
             })
-        self.labor_stats = rows
         logger.info("Loaded %d aggregated RAIS records", len(rows))
+        return rows
 
-    def _aggregate_raw(self, raw_path: Path) -> None:
+    def _aggregate_raw(self, raw_path: Path) -> list[dict[str, Any]]:
         """Aggregate raw RAIS microdata file by CNAE + UF."""
         logger.info("Aggregating raw RAIS data from %s", raw_path.name)
 
@@ -164,26 +162,28 @@ class RaisPipeline(Pipeline):
                 "source": "rais_mte",
             })
 
-        self.labor_stats = rows
         logger.info(
             "Aggregated %d rows into %d CNAE+UF stats from %d raw records",
             total_rows, len(rows), total_rows,
         )
 
-    def transform(self) -> None:
-        """No additional transform needed — aggregation is done in extract."""
+        return rows
 
-    def load(self) -> None:
+    def transform(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """No additional transform needed — aggregation is done in extract."""
+        return data
+
+    def load(self, data: list[dict[str, Any]]) -> None:
         """Load LaborStats nodes (sector reference data, no relationships)."""
         loader = Neo4jBatchLoader(self.driver)
 
-        if not self.labor_stats:
+        if not data:
             logger.warning("No RAIS labor stats to load")
             return
 
         # Load LaborStats nodes
-        logger.info("Loading %d LaborStats nodes...", len(self.labor_stats))
-        loader.load_nodes("LaborStats", self.labor_stats, key_field="stats_id")
+        logger.info("Loading %d LaborStats nodes...", len(data))
+        loader.load_nodes("LaborStats", data, key_field="stats_id")
 
         # Create index for efficient matching
         with self.driver.session(database=self.neo4j_database) as session:
@@ -199,7 +199,7 @@ class RaisPipeline(Pipeline):
         logger.info("LaborStats nodes loaded. Indexes created.")
         logger.info(
             "Total: %d stats covering %d establishments, %d employees",
-            len(self.labor_stats),
-            sum(s["establishment_count"] for s in self.labor_stats),
-            sum(s["total_employees"] for s in self.labor_stats),
+            len(data),
+            sum(s["establishment_count"] for s in data),
+            sum(s["total_employees"] for s in data),
         )

@@ -54,59 +54,57 @@ class TransferegovPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_emendas: pd.DataFrame = pd.DataFrame()
-        self._raw_favorecidos: pd.DataFrame = pd.DataFrame()
-        self._raw_convenios: pd.DataFrame = pd.DataFrame()
-        self.amendments: list[dict[str, Any]] = []
-        self.authors: list[dict[str, Any]] = []
-        self.author_rels: list[dict[str, Any]] = []
-        self.favorecido_companies: list[dict[str, Any]] = []
-        self.favorecido_persons: list[dict[str, Any]] = []
-        self.favorecido_rels: list[dict[str, Any]] = []
-        self.convenios: list[dict[str, Any]] = []
-        self.convenio_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         src_dir = Path(self.data_dir) / "transferegov"
-        self._raw_emendas = pd.read_csv(
+        dict_result: dict[str, pd.DataFrame] = {}
+        dict_result["raw_emendas"] = pd.read_csv(
             src_dir / "EmendasParlamentares.csv",
             dtype=str,
             encoding="latin-1",
             sep=";",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
-        self._raw_favorecidos = pd.read_csv(
+        dict_result["raw_favorecidos"] = pd.read_csv(
             src_dir / "EmendasParlamentares_PorFavorecido.csv",
             dtype=str,
             encoding="latin-1",
             sep=";",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
-        self._raw_convenios = pd.read_csv(
+        dict_result["raw_convenios"] = pd.read_csv(
             src_dir / "EmendasParlamentares_Convenios.csv",
             dtype=str,
             encoding="latin-1",
             sep=";",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
+        return dict_result
 
-    def transform(self) -> None:
-        self._transform_amendments()
-        self._transform_favorecidos()
-        self._transform_convenios()
+    def transform(self, data: dict[str, pd.DataFrame]) -> None:
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-    def _transform_amendments(self) -> None:
+        dict_result.update(self._transform_amendments(data["raw_emendas"]))
+        dict_result.update(self._transform_favorecidos(data["raw_favorecidos"]))
+        dict_result.update(self._transform_convenios(data["raw_convenios"]))
+
+        return dict_result
+
+    def _transform_amendments(self, raw_emendas: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Transform main amendments file: Amendment nodes + Person authors."""
         amendments: list[dict[str, Any]] = []
         authors: list[dict[str, Any]] = []
         author_rels: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
         # Group by amendment code to aggregate values
-        grouped = self._raw_emendas.groupby("Código da Emenda")
+        grouped = raw_emendas.groupby("Código da Emenda")
 
         for code, group in grouped:
             code_str = str(code).strip()
@@ -151,18 +149,21 @@ class TransferegovPipeline(Pipeline):
                     "source_key": author_code,
                     "target_key": code_str,
                 })
+        dict_result = {
+            "amendments": deduplicate_rows(amendments, ["amendment_id"]),
+            "authors": deduplicate_rows(authors, ["author_key"]),
+            "author_rels": author_rels,
+        }
+        return dict_result
 
-        self.amendments = deduplicate_rows(amendments, ["amendment_id"])
-        self.authors = deduplicate_rows(authors, ["author_key"])
-        self.author_rels = author_rels
-
-    def _transform_favorecidos(self) -> None:
+    def _transform_favorecidos(self, raw_favorecidos: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Transform favorecidos: companies/persons receiving amendment funds."""
         companies: list[dict[str, Any]] = []
         persons: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-        for _, row in self._raw_favorecidos.iterrows():
+        for _, row in raw_favorecidos.iterrows():
             emenda_code = str(row["Código da Emenda"]).strip()
             if not emenda_code or emenda_code == "Sem informação":
                 continue
@@ -210,17 +211,21 @@ class TransferegovPipeline(Pipeline):
                     "uf": uf,
                 })
             # Skip Unidade Gestora, Inscrição Genérica, Inválido
+        dict_result = {
+            "favorecido_companies": deduplicate_rows(companies, ["cnpj"]),
+            "favorecido_persons": deduplicate_rows(persons, ["cpf"]),
+            "favorecido_rels": rels,
+        }
 
-        self.favorecido_companies = deduplicate_rows(companies, ["cnpj"])
-        self.favorecido_persons = deduplicate_rows(persons, ["cpf"])
-        self.favorecido_rels = rels
+        return dict_result
 
-    def _transform_convenios(self) -> None:
+    def _transform_convenios(self, raw_convenios: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Transform convênios linked to amendments."""
         convenios: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-        for _, row in self._raw_convenios.iterrows():
+        for _, row in raw_convenios.iterrows():
             emenda_code = str(row["Código da Emenda"]).strip()
             if not emenda_code or emenda_code == "Sem informação":
                 continue
@@ -248,26 +253,36 @@ class TransferegovPipeline(Pipeline):
                 "source_key": emenda_code,
                 "target_key": numero,
             })
+        dict_result = {
+            "convenios": deduplicate_rows(convenios, ["convenio_id"]),
+            "convenio_rels": rels,
+        }
+        return dict_result
 
-        self.convenios = deduplicate_rows(convenios, ["convenio_id"])
-        self.convenio_rels = rels
-
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
+        amendments = data.get("amendments", [])
+        authors = data.get("authors", [])
+        author_rels = data.get("author_rels", [])
+        favorecido_companies = data.get("favorecido_companies", [])
+        favorecido_persons = data.get("favorecido_persons", [])
+        favorecido_rels = data.get("favorecido_rels", [])
+        convenios = data.get("convenios", [])
+        convenio_rels = data.get("convenio_rels", [])
 
         # 1. Amendment nodes
-        if self.amendments:
-            loader.load_nodes("Amendment", self.amendments, key_field="amendment_id")
+        if amendments:
+            loader.load_nodes("Amendment", amendments, key_field="amendment_id")
 
         # 2. Person nodes for authors (keyed by author_key for entity resolution)
-        if self.authors:
-            loader.load_nodes("Person", self.authors, key_field="author_key")
+        if authors:
+            loader.load_nodes("Person", authors, key_field="author_key")
 
         # 3. Person -[:AUTOR_EMENDA]-> Amendment
-        if self.author_rels:
+        if author_rels:
             loader.load_relationships(
                 rel_type="AUTOR_EMENDA",
-                rows=self.author_rels,
+                rows=author_rels,
                 source_label="Person",
                 source_key="author_key",
                 target_label="Amendment",
@@ -275,24 +290,24 @@ class TransferegovPipeline(Pipeline):
             )
 
         # 4. Company nodes for favorecidos
-        if self.favorecido_companies:
+        if favorecido_companies:
             loader.load_nodes(
-                "Company", self.favorecido_companies, key_field="cnpj"
+                "Company", favorecido_companies, key_field="cnpj"
             )
 
         # 5. Person nodes for favorecidos
-        if self.favorecido_persons:
+        if favorecido_persons:
             loader.load_nodes(
-                "Person", self.favorecido_persons, key_field="cpf"
+                "Person", favorecido_persons, key_field="cpf"
             )
 
         # 6. Amendment -[:BENEFICIOU]-> Company/Person
-        if self.favorecido_rels:
+        if favorecido_rels:
             company_rels = [
-                r for r in self.favorecido_rels if r["entity_type"] == "Company"
+                r for r in favorecido_rels if r["entity_type"] == "Company"
             ]
             person_rels = [
-                r for r in self.favorecido_rels if r["entity_type"] == "Person"
+                r for r in favorecido_rels if r["entity_type"] == "Person"
             ]
 
             if company_rels:
@@ -305,7 +320,7 @@ class TransferegovPipeline(Pipeline):
                     "r.municipality = row.municipality, "
                     "r.uf = row.uf"
                 )
-                loader.run_query_with_retry(query, company_rels)
+                loader.run_query(query, company_rels)
 
             if person_rels:
                 query = (
@@ -317,17 +332,17 @@ class TransferegovPipeline(Pipeline):
                     "r.municipality = row.municipality, "
                     "r.uf = row.uf"
                 )
-                loader.run_query_with_retry(query, person_rels)
+                loader.run_query(query, person_rels)
 
         # 7. Convenio nodes
-        if self.convenios:
-            loader.load_nodes("Convenio", self.convenios, key_field="convenio_id")
+        if convenios:
+            loader.load_nodes("Convenio", convenios, key_field="convenio_id")
 
         # 8. Amendment -[:GEROU_CONVENIO]-> Convenio
-        if self.convenio_rels:
+        if convenio_rels:
             loader.load_relationships(
                 rel_type="GEROU_CONVENIO",
-                rows=self.convenio_rels,
+                rows=convenio_rels,
                 source_label="Amendment",
                 source_key="amendment_id",
                 target_label="Convenio",

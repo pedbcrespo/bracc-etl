@@ -48,9 +48,10 @@ class CepimPipeline(Pipeline):
             dtype=str,
             encoding="latin-1",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
 
-    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    def transform(self, data: pd.DataFrame) -> dict[str, Any]:
         ngos: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
 
@@ -88,27 +89,29 @@ class CepimPipeline(Pipeline):
 
         return {
             "ngos": deduplicate_rows(ngos, ["ngo_id"]),
-            "company_rels": company_rels
+            "company_rels": company_rels,
         }
-
-    def load(self, transformed_data: dict[str, list[dict[str, Any]]]) -> None:
+    
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        ngos = data.get("ngos", [])
+        company_rels = data.get("company_rels", []) 
         loader = Neo4jBatchLoader(self.driver)
 
-        if transformed_data["ngos"]:
-            loader.load_nodes("BarredNGO", transformed_data["ngos"], key_field="ngo_id")
+        if ngos:
+            loader.load_nodes("BarredNGO", ngos, key_field="ngo_id")
 
         # Ensure Company nodes exist for CNPJ linking
-        if transformed_data["company_rels"]:
+        if company_rels:
             companies = [
-                {"cnpj": rel["source_key"]} for rel in transformed_data["company_rels"]
+                {"cnpj": rel["source_key"]} for rel in company_rels
             ]
             loader.load_nodes("Company", deduplicate_rows(companies, ["cnpj"]), key_field="cnpj")
 
-        if transformed_data["company_rels"]:
+        if company_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (c:Company {cnpj: row.source_key}) "
                 "MATCH (b:BarredNGO {ngo_id: row.target_key}) "
                 "MERGE (c)-[:IMPEDIDA]->(b)"
             )
-            loader.run_query_with_retry(query, transformed_data["company_rels"])
+            loader.run_query_with_retry(query, company_rels)

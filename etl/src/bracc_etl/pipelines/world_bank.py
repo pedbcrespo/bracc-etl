@@ -41,36 +41,36 @@ class WorldBankPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self._raw: pd.DataFrame = pd.DataFrame()
         self.sanctions: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         wb_dir = Path(self.data_dir) / "world_bank"
         csv_path = wb_dir / "debarred.csv"
-
+        raw: pd.DataFrame = pd.DataFrame()
         if not csv_path.exists():
             logger.warning("[world_bank] debarred.csv not found at %s", csv_path)
-            return
+            return pd.DataFrame()
 
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             keep_default_na=False,
         )
 
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw = raw.head(self.limit)
 
-        logger.info("[world_bank] Extracted %d rows", len(self._raw))
+        logger.info("[world_bank] Extracted %d rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         sanctions: list[dict[str, Any]] = []
-
-        for _, row in self._raw.iterrows():
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        for _, row in data.iterrows():
             # Support both old column names (Firm Name) and new API format (SUPP_NAME)
             firm_name_raw = str(
                 row.get("Firm Name") or row.get("SUPP_NAME") or ""
@@ -105,19 +105,20 @@ class WorldBankPipeline(Pipeline):
                 "source_list": "WORLD_BANK",
             })
 
-        self.sanctions = deduplicate_rows(sanctions, ["sanction_id"])
+        dict_result["sanctions"] = deduplicate_rows(sanctions, ["sanction_id"])
         logger.info(
             "[world_bank] Transformed %d InternationalSanction nodes",
-            len(self.sanctions),
+            len(dict_result["sanctions"]),
         )
+        return dict_result
 
-    def load(self) -> None:
+    def load(self, dict_result: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.sanctions:
+        if dict_result["sanctions"]:
             loaded = loader.load_nodes(
                 "InternationalSanction",
-                self.sanctions,
+                dict_result["sanctions"],
                 key_field="sanction_id",
             )
             logger.info("[world_bank] Loaded %d InternationalSanction nodes", loaded)

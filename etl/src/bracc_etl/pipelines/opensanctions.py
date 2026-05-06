@@ -80,15 +80,11 @@ class OpenSanctionsPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_entities: list[dict[str, Any]] = []
-        self.global_peps: list[dict[str, Any]] = []
-        self.pep_match_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, Any]]:
         data_dir = Path(self.data_dir) / "opensanctions"
         ftm_path = data_dir / "entities.ftm.json"
 
@@ -97,6 +93,7 @@ class OpenSanctionsPipeline(Pipeline):
             return
 
         entities: list[dict[str, Any]] = []
+        raw_entities: list[dict[str, Any]] = []
         with open(ftm_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -108,14 +105,15 @@ class OpenSanctionsPipeline(Pipeline):
                 except json.JSONDecodeError:
                     continue
 
-        self._raw_entities = entities
-        logger.info("[opensanctions] Extracted %d raw entities", len(self._raw_entities))
+        raw_entities = entities
+        logger.info("[opensanctions] Extracted %d raw entities", len(raw_entities))
+        return raw_entities
 
-    def _transform_peps(self) -> list[dict[str, Any]]:
+    def _transform_peps(self, raw_entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Filter and transform Brazilian-connected PEP entities."""
         peps: list[dict[str, Any]] = []
 
-        for entity in self._raw_entities:
+        for entity in raw_entities:
             schema = entity.get("schema", "")
             if schema != "Person":
                 continue
@@ -157,10 +155,10 @@ class OpenSanctionsPipeline(Pipeline):
 
         return peps
 
-    def _build_cpf_match_rels(self) -> list[dict[str, Any]]:
+    def _build_cpf_match_rels(self, global_peps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Build GLOBAL_PEP_MATCH relationships based on CPF."""
         rels: list[dict[str, Any]] = []
-        for pep in self.global_peps:
+        for pep in global_peps:
             cpf = pep.get("cpf", "")
             if not cpf:
                 continue
@@ -172,24 +170,29 @@ class OpenSanctionsPipeline(Pipeline):
             })
         return rels
 
-    def transform(self) -> None:
-        self.global_peps = deduplicate_rows(self._transform_peps(), ["pep_id"])
-        self.pep_match_rels = self._build_cpf_match_rels()
+    def transform(self, data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        global_peps: list[dict[str, Any]] = deduplicate_rows(self._transform_peps(data), ["pep_id"])
+        pep_match_rels: list[dict[str, Any]] = self._build_cpf_match_rels(global_peps)
 
         logger.info(
             "[opensanctions] Transformed %d GlobalPEP nodes, %d CPF match relationships",
-            len(self.global_peps),
-            len(self.pep_match_rels),
+            len(global_peps),
+            len(pep_match_rels),
         )
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=500)
+        return {
+            "global_peps": global_peps,
+            "pep_match_rels": pep_match_rels
+        }
 
-        if self.global_peps:
-            loaded = loader.load_nodes("GlobalPEP", self.global_peps, key_field="pep_id")
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
+
+        if data["global_peps"]:
+            loaded = loader.load_nodes("GlobalPEP", data["global_peps"], key_field="pep_id")
             logger.info("[opensanctions] Loaded %d GlobalPEP nodes", loaded)
 
-        if self.pep_match_rels:
+        if data["pep_match_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
@@ -198,5 +201,5 @@ class OpenSanctionsPipeline(Pipeline):
                 "SET r.match_type = row.match_type, "
                 "    r.confidence = row.confidence"
             )
-            loaded = loader.run_query_with_retry(query, self.pep_match_rels)
+            loaded = loader.run_query_with_retry(query, data["pep_match_rels"])
             logger.info("[opensanctions] Loaded %d GLOBAL_PEP_MATCH relationships", loaded)

@@ -41,32 +41,30 @@ class InepPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self.schools: list[dict[str, Any]] = []
-        self.school_company_links: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, str]]:
         inep_dir = Path(self.data_dir) / "inep"
         csv_path = inep_dir / "microdados_ed_basica_2022.csv"
+        raw_rows: list[dict[str, str]] = []
 
         if not csv_path.exists():
             msg = f"INEP CSV not found at {csv_path}"
             raise FileNotFoundError(msg)
 
         logger.info("[inep] Reading %s ...", csv_path)
-        self._raw_rows: list[dict[str, str]] = []
 
         with open(csv_path, encoding="latin-1", newline="") as f:
             reader = csv.DictReader(f, delimiter=";")
             for i, row in enumerate(reader):
-                self._raw_rows.append(row)
+                raw_rows.append(row)
                 if self.limit and i + 1 >= self.limit:
                     break
 
-        logger.info("[inep] Extracted %d rows", len(self._raw_rows))
+        logger.info("[inep] Extracted %d rows", len(raw_rows))
+        return raw_rows
 
     def _parse_int(self, value: str) -> int:
         """Parse an integer string, returning 0 for empty/invalid."""
@@ -78,11 +76,11 @@ class InepPipeline(Pipeline):
         except ValueError:
             return 0
 
-    def transform(self) -> None:
+    def transform(self, data: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
         schools: list[dict[str, Any]] = []
         links: list[dict[str, Any]] = []
 
-        for row in self._raw_rows:
+        for row in data:
             school_id = row.get("CO_ENTIDADE", "").strip()
             if not school_id:
                 continue
@@ -133,30 +131,34 @@ class InepPipeline(Pipeline):
                         "target_key": school_id,
                     })
 
-        self.schools = schools
-        self.school_company_links = links
+        schools = schools
+        school_company_links = links
         logger.info(
             "[inep] Transformed %d schools, %d company links",
-            len(self.schools),
-            len(self.school_company_links),
+            len(schools),
+            len(school_company_links),
         )
+        return {
+            "schools": schools,
+            "school_company_links": school_company_links,
+        }
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, str]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.schools:
-            loader.load_nodes("Education", self.schools, key_field="school_id")
-            logger.info("[inep] Loaded %d Education nodes", len(self.schools))
+        if data["schools"]:
+            loader.load_nodes("Education", data["schools"], key_field="school_id")
+            logger.info("[inep] Loaded %d Education nodes", len(data["schools"]))
 
-        if self.school_company_links:
+        if data["school_company_links"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (e:Education {school_id: row.target_key}) "
                 "MERGE (c:Company {cnpj: row.source_key}) "
                 "MERGE (c)-[:MANTEDORA_DE]->(e)"
             )
-            loader.run_query_with_retry(query, self.school_company_links)
+            loader.run_query(query, data["school_company_links"])
             logger.info(
                 "[inep] Created %d MANTEDORA_DE relationships",
-                len(self.school_company_links),
+                len(data["school_company_links"]),
             )

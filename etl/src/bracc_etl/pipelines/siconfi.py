@@ -38,15 +38,11 @@ class SiconfiPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: list[dict[str, Any]] = []
-        self.finances: list[dict[str, Any]] = []
-        self.municipality_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, Any]]:
         siconfi_dir = Path(self.data_dir) / "siconfi"
         all_records: list[dict[str, Any]] = []
 
@@ -66,15 +62,14 @@ class SiconfiPipeline(Pipeline):
 
         if self.limit:
             all_records = all_records[: self.limit]
+        logger.info("Extracted %d SICONFI records", len(all_records))
+        return all_records
 
-        self._raw = all_records
-        logger.info("Extracted %d SICONFI records", len(self._raw))
-
-    def transform(self) -> None:
+    def transform(self, data: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         finances: list[dict[str, Any]] = []
         municipality_rels: list[dict[str, Any]] = []
-
-        for row in self._raw:
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        for row in data:
             cod_ibge = str(row.get("cod_ibge", "")).strip()
             if not cod_ibge:
                 continue
@@ -122,26 +117,29 @@ class SiconfiPipeline(Pipeline):
                     "municipality": ente,
                 })
 
-        self.finances = deduplicate_rows(finances, ["finance_id"])
-        self.municipality_rels = municipality_rels
+        dict_result["finances"] = deduplicate_rows(finances, ["finance_id"])
+        dict_result["municipality_rels"] = municipality_rels
+
         logger.info(
             "Transformed %d finance records, %d municipality links",
-            len(self.finances),
-            len(self.municipality_rels),
+            len(dict_result["finances"]),
+            len(dict_result["municipality_rels"]),
         )
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+        return dict_result
 
-        if self.finances:
-            loader.load_nodes("MunicipalFinance", self.finances, key_field="finance_id")
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.municipality_rels:
+        if data.get("finances"):
+            loader.load_nodes("MunicipalFinance", data["finances"], key_field="finance_id")
+
+        if data.get("municipality_rels"):
             # Ensure Company nodes exist for municipalities
             muni_nodes = deduplicate_rows(
                 [
                     {"cnpj": r["cnpj"], "razao_social": r["municipality"]}
-                    for r in self.municipality_rels
+                    for r in data["municipality_rels"]
                 ],
                 ["cnpj"],
             )
@@ -153,4 +151,4 @@ class SiconfiPipeline(Pipeline):
                 "MATCH (f:MunicipalFinance {finance_id: row.finance_id}) "
                 "MERGE (c)-[:DECLAROU_FINANCA]->(f)"
             )
-            loader.run_query_with_retry(query, self.municipality_rels)
+            loader.run_query_with_retry(query, data["municipality_rels"])

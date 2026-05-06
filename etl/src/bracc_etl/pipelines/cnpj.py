@@ -221,34 +221,19 @@ class CNPJPipeline(Pipeline):
             driver, data_dir, limit=limit, history=history, **kwargs,
         )
         self.run_id = f"cnpj-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
-        self._raw_empresas: pd.DataFrame = pd.DataFrame()
-        self._raw_socios: pd.DataFrame = pd.DataFrame()
-        self._raw_estabelecimentos: pd.DataFrame = pd.DataFrame()
         self._reference_tables: dict[str, dict[str, str]] = {}
         # basico -> (cnpj_full, cnae_principal, uf, municipio)
         self._estab_lookup: dict[str, tuple[str, str, str, str]] = {}
-        self.companies: list[dict[str, Any]] = []
-        # PF partners with strong CPF identity
-        self.partners: list[dict[str, Any]] = []
-        # PF partners with masked/partial/invalid docs
-        self.partial_partners: list[dict[str, Any]] = []
-        # Person -> Company
-        self.relationships: list[dict[str, Any]] = []
-        # Partner -> Company
-        self.partner_relationships: list[dict[str, Any]] = []
-        # Company -> Company
-        self.pj_relationships: list[dict[str, Any]] = []
-        # Historical socio snapshots
-        self.snapshot_relationships: list[dict[str, Any]] = []
+ 
 
     # --- Reference tables ---
 
-    def _load_reference_tables(self) -> None:
+    def _load_reference_tables(self) -> dict[str, dict[str, str]]:
         """Load reference lookup tables (naturezas, qualificacoes, etc.)."""
         ref_dir = Path(self.data_dir) / "cnpj" / "reference"
         if not ref_dir.exists():
-            return
-
+            return {}
+        table_reference = {}
         for table_name in REFERENCE_TABLES:
             files = list(ref_dir.glob(f"*{table_name}*"))
             if not files:
@@ -262,12 +247,14 @@ class CNPJPipeline(Pipeline):
                     names=["codigo", "descricao"],
                     dtype=str,
                     keep_default_na=False,
+                    chunksize=self.chunk_size,
                 )
                 lookup = dict(zip(df["codigo"], df["descricao"], strict=False))
-                self._reference_tables[table_name.lower()] = lookup
+                table_reference[table_name.lower()] = lookup
                 logger.info("Loaded reference table %s: %d entries", table_name, len(lookup))
             except Exception:
                 logger.warning("Could not load reference table %s", table_name)
+        return table_reference
 
     def _resolve_reference(self, table: str, code: str) -> str:
         """Look up a code in a reference table. Returns code if not found."""
@@ -289,7 +276,7 @@ class CNPJPipeline(Pipeline):
         renames columns to match the RF schema used by transform().
         """
         cnpj_dir = Path(self.data_dir) / "cnpj"
-        files = [f for f in sorted(cnpj_dir.glob(f"extracted/{pattern}")) if f.suffix != ".zip"]
+        files = sorted(cnpj_dir.glob(f"extracted/{pattern}"))
         if not files:
             return pd.DataFrame()
 
@@ -321,9 +308,9 @@ class CNPJPipeline(Pipeline):
         """Read Receita Federal headerless CSVs with chunking for memory efficiency."""
         cnpj_dir = Path(self.data_dir) / "cnpj"
         # Search both extracted/ subdirectory and cnpj/ root
-        files = [f for f in sorted(cnpj_dir.glob(f"extracted/{pattern}")) if f.suffix != ".zip"]
+        files = sorted(cnpj_dir.glob(f"extracted/{pattern}"))
         if not files:
-            files = [f for f in sorted(cnpj_dir.glob(pattern)) if f.suffix != ".zip"]
+            files = sorted(cnpj_dir.glob(pattern))
         if not files:
             return pd.DataFrame(columns=columns)
 
@@ -356,7 +343,7 @@ class CNPJPipeline(Pipeline):
         logger.info("Read %d rows from %s", len(result), pattern)
         return result
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         """Extract data from Receita Federal open data files.
 
         Tries three formats in order:
@@ -365,7 +352,11 @@ class CNPJPipeline(Pipeline):
         3. Simple CSV: header-based CSVs with our own column names (dev/test)
         """
         # Load reference tables if available
-        self._load_reference_tables()
+        table_references = self._load_reference_tables()
+
+        raw_empresas: pd.DataFrame = pd.DataFrame()
+        raw_socios: pd.DataFrame = pd.DataFrame()
+        raw_estabelecimentos: pd.DataFrame = pd.DataFrame()
 
         cnpj_dir = Path(self.data_dir) / "cnpj"
 
@@ -388,16 +379,20 @@ class CNPJPipeline(Pipeline):
             )
             if not hist_empresas.empty and not hist_socios.empty:
                 logger.info("Using CNPJ history mode from *_history.csv files")
-                self._raw_empresas = hist_empresas
-                self._raw_socios = hist_socios
-                self._raw_estabelecimentos = hist_estabelecimentos
+                raw_empresas = hist_empresas
+                raw_socios = hist_socios
+                raw_estabelecimentos = hist_estabelecimentos
                 logger.info(
                     "Extracted (history): %d empresas, %d socios, %d estabelecimentos",
-                    len(self._raw_empresas),
-                    len(self._raw_socios),
-                    len(self._raw_estabelecimentos),
+                    len(raw_empresas),
+                    len(raw_socios),
+                    len(raw_estabelecimentos),
                 )
-                return
+                return {
+                    "empresas": raw_empresas,
+                    "socios": raw_socios,   
+                    "estabelecimentos": raw_estabelecimentos,
+                }
 
         # 1. Try real RF format: *EMPRE* or Empresas*
         rf_empresas = self._read_rf_chunks("*EMPRE*", EMPRESAS_COLS)
@@ -405,15 +400,15 @@ class CNPJPipeline(Pipeline):
             rf_empresas = self._read_rf_chunks("Empresas*", EMPRESAS_COLS)
 
         if not rf_empresas.empty:
-            self._raw_empresas = rf_empresas
-            self._raw_socios = self._read_rf_chunks("*SOCIO*", SOCIOS_COLS)
-            if self._raw_socios.empty:
-                self._raw_socios = self._read_rf_chunks("Socios*", SOCIOS_COLS)
-            self._raw_estabelecimentos = self._read_rf_chunks(
+            raw_empresas = rf_empresas
+            raw_socios = self._read_rf_chunks("*SOCIO*", SOCIOS_COLS)
+            if raw_socios.empty:
+                raw_socios = self._read_rf_chunks("Socios*", SOCIOS_COLS)
+            raw_estabelecimentos = self._read_rf_chunks(
                 "*ESTABELE*", ESTABELECIMENTOS_COLS,
             )
-            if self._raw_estabelecimentos.empty:
-                self._raw_estabelecimentos = self._read_rf_chunks(
+            if raw_estabelecimentos.empty:
+                raw_estabelecimentos = self._read_rf_chunks(
                     "Estabelecimentos*", ESTABELECIMENTOS_COLS,
                 )
         else:
@@ -423,11 +418,11 @@ class CNPJPipeline(Pipeline):
             )
             if not bq_empresas.empty:
                 logger.info("Using Base dos Dados (BigQuery) exported data")
-                self._raw_empresas = bq_empresas
-                self._raw_socios = self._read_bq_csv(
+                raw_empresas = bq_empresas
+                raw_socios = self._read_bq_csv(
                     "socios_*.csv", BQ_SOCIOS_RENAME, BQ_SOCIOS_DROP,
                 )
-                self._raw_estabelecimentos = self._read_bq_csv(
+                raw_estabelecimentos = self._read_bq_csv(
                     "estabelecimentos_*.csv",
                     BQ_ESTABELECIMENTOS_RENAME,
                     BQ_ESTABELECIMENTOS_DROP,
@@ -438,24 +433,29 @@ class CNPJPipeline(Pipeline):
                 socios_path = cnpj_dir / "socios.csv"
                 estabelecimentos_path = cnpj_dir / "estabelecimentos.csv"
                 if empresas_path.exists():
-                    self._raw_empresas = pd.read_csv(
+                    raw_empresas = pd.read_csv(
                         empresas_path, dtype=str, keep_default_na=False,
                     )
                 if socios_path.exists():
-                    self._raw_socios = pd.read_csv(
+                    raw_socios = pd.read_csv(
                         socios_path, dtype=str, keep_default_na=False,
                     )
                 if estabelecimentos_path.exists():
-                    self._raw_estabelecimentos = pd.read_csv(
+                    raw_estabelecimentos = pd.read_csv(
                         estabelecimentos_path, dtype=str, keep_default_na=False,
                     )
 
         logger.info(
             "Extracted: %d empresas, %d socios, %d estabelecimentos",
-            len(self._raw_empresas),
-            len(self._raw_socios),
-            len(self._raw_estabelecimentos),
+            len(raw_empresas),
+            len(raw_socios),
+            len(raw_estabelecimentos),
         )
+        return {
+            "raw_empresas": raw_empresas,
+            "raw_socios": raw_socios,
+            "raw_estabelecimentos": raw_estabelecimentos,
+        }
 
     def _snapshot_from_row(self, row: pd.Series) -> str:
         """Extract canonical snapshot date from row metadata."""
@@ -473,7 +473,7 @@ class CNPJPipeline(Pipeline):
 
     # --- Vectorized transform helpers ---
 
-    def _build_estab_lookup(self, df: pd.DataFrame) -> None:
+    def _build_estab_lookup(self, df: pd.DataFrame) -> dict[str, tuple[str, str, str, str]]:
         """Add estabelecimentos rows to estab_lookup (vectorized prep, zip on deduped)."""
         df = df.copy()
         df["basico"] = df["cnpj_basico"].astype(str).str.zfill(8)
@@ -484,7 +484,7 @@ class CNPJPipeline(Pipeline):
         mask = ~df["basico"].isin(self._estab_lookup)
         df = df.loc[mask].drop_duplicates(subset="basico", keep="first")
         if df.empty:
-            return
+            return self._estab_lookup
         for basico, cnpj_raw, cnae, uf, mun in zip(
             df["basico"],
             df["cnpj_raw"],
@@ -494,6 +494,7 @@ class CNPJPipeline(Pipeline):
             strict=False,
         ):
             self._estab_lookup[basico] = (format_cnpj(cnpj_raw), cnae, uf, mun)
+        return self._estab_lookup
 
     def _transform_empresas_rf(self, df: pd.DataFrame) -> list[dict[str, Any]]:
         """Vectorized transform for RF-format empresas."""
@@ -933,7 +934,7 @@ class CNPJPipeline(Pipeline):
                 "    r.temporal_status = row.temporal_status, "
                 "    r.temporal_rule = row.temporal_rule"
             )
-            loader.run_query_with_retry(query, label_rows)
+            loader.run_query(query, label_rows)
 
     def _rebuild_latest_projection_from_snapshots(self) -> None:
         """Rebuild factual SOCIO_DE from latest snapshot per source/target pair."""
@@ -961,23 +962,35 @@ class CNPJPipeline(Pipeline):
                 """,
             )
 
-    def transform(self) -> None:
+    def transform(self, data:dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
         """Transform raw data into normalized company, partner, and relationship records."""
-        if not self._raw_estabelecimentos.empty:
-            self._build_estab_lookup(self._raw_estabelecimentos)
+        raw_empresas = data["raw_empresas"]
+        raw_socios = data["raw_socios"]
+        raw_estabelecimentos = data["raw_estabelecimentos"]
 
-        is_rf = "cnpj_basico" in self._raw_empresas.columns
+        relationships: list[dict[str, Any]]
+        partner_relationships: list[dict[str, Any]]
+        pj_relationships: list[dict[str, Any]]
+        companies: list[dict[str, Any]]
+        dict_result: dict[str, Any]
+
+        if not raw_estabelecimentos.empty:
+            self._build_estab_lookup(raw_estabelecimentos)
+
+        is_rf = "cnpj_basico" in raw_empresas.columns
         if is_rf:
-            companies = self._transform_empresas_rf(self._raw_empresas)
+            companies = self._transform_empresas_rf(raw_empresas)
         else:
-            companies = self._transform_empresas_simple(self._raw_empresas)
-        self.companies = deduplicate_rows(companies, ["cnpj"])
-        logger.info("Transformed %d companies", len(self.companies))
+            companies = self._transform_empresas_simple(raw_empresas)
+            companies = deduplicate_rows(companies, ["cnpj"])
+        dict_result["companies"] = companies
+        
+        logger.info("Transformed %d companies", len(companies))
 
-        is_rf_socios = "cpf_cnpj_socio" in self._raw_socios.columns
+        is_rf_socios = "cpf_cnpj_socio" in raw_socios.columns
         if is_rf_socios:
             partners, partial_partners, pf_rels, partial_rels, pj_rels = self._transform_socios_rf(
-                self._raw_socios,
+                raw_socios,
             )
         else:
             (
@@ -986,47 +999,57 @@ class CNPJPipeline(Pipeline):
                 pf_rels,
                 partial_rels,
                 pj_rels,
-            ) = self._transform_socios_simple(self._raw_socios)
-        self.partners = deduplicate_rows(partners, ["cpf"])
-        self.partial_partners = deduplicate_rows(partial_partners, ["partner_id"])
-        if self.history:
-            self.snapshot_relationships = self._build_snapshot_relationships(
+            ) = self._transform_socios_simple(raw_socios)
+
+        dict_result = {
+            "partners": deduplicate_rows(partners, ["cpf"]),
+            "partial_partners": deduplicate_rows(partial_partners, ["partner_id"])
+        }
+
+        if self.history: 
+            dict_result["snapshot_relationships"] = self._build_snapshot_relationships(
                 pf_rels,
                 partial_rels,
                 pj_rels,
             )
             (
-                self.relationships,
-                self.partner_relationships,
-                self.pj_relationships,
+                relationships,
+                partner_relationships,
+                pj_relationships,
             ) = self._latest_projection(self.snapshot_relationships)
         else:
-            self.relationships = pf_rels
-            self.partner_relationships = partial_rels
-            self.pj_relationships = pj_rels
+            relationships = pf_rels
+            partner_relationships = partial_rels
+            pj_relationships = pj_rels
         logger.info(
             "Transformed %d strong PF partners, %d partial partners, "
             "%d PF relationships, %d Partner relationships, %d PJ relationships",
-            len(self.partners),
-            len(self.partial_partners),
-            len(self.relationships),
-            len(self.partner_relationships),
-            len(self.pj_relationships),
+            len(partners),
+            len(partial_partners),
+            len(relationships),
+            len(partner_relationships),
+            len(pj_relationships),
         )
+
+        dict_result["relationships"] = relationships
+        dict_result["partner_relationships"] = partner_relationships
+        dict_result["pj_relationships"] = pj_relationships
+
         if self.history:
             logger.info(
                 "Transformed %d historical SOCIO_DE_SNAPSHOT rows",
                 len(self.snapshot_relationships),
             )
+        return dict_result
 
     # --- Streaming pipeline for large datasets ---
 
     def _find_rf_files(self, pattern: str) -> list[Path]:
         """Find RF-format data files, checking extracted/ then cnpj/ root."""
         cnpj_dir = Path(self.data_dir) / "cnpj"
-        files = [f for f in sorted(cnpj_dir.glob(f"extracted/{pattern}")) if f.suffix != ".zip"]
+        files = sorted(cnpj_dir.glob(f"extracted/{pattern}"))
         if not files:
-            files = [f for f in sorted(cnpj_dir.glob(pattern)) if f.suffix != ".zip"]
+            files = sorted(cnpj_dir.glob(pattern))
         return files
 
     def _find_bq_files(self, pattern: str) -> list[Path]:
@@ -1104,9 +1127,7 @@ class CNPJPipeline(Pipeline):
             bq_estab = bq_emp = bq_socio = []
 
         # Phase 1: Build estab_lookup
-        if start_phase > 1:
-            logger.info("Skipping Phase 1 -- start_phase=%d", start_phase)
-        elif use_bq:
+        if use_bq:
             logger.info("Phase 1: Building estab_lookup from %d BQ files", len(bq_estab))
             for f in bq_estab:
                 logger.info("  Reading %s...", f.name)
@@ -1267,22 +1288,29 @@ class CNPJPipeline(Pipeline):
             total_pj_rels,
         )
 
-    def load(self) -> None:
+    def load(self, data: dict[str, Any]) -> None:
         loader = Neo4jBatchLoader(self.driver)
+        companies = data["companies"]
+        partners = data["partners"]
+        partial_partners = data["partial_partners"]
+        relationships = data["relationships"]
+        partner_relationships = data["partner_relationships"]
+        pj_relationships = data["pj_relationships"]
+        snapshot_relationships = data["snapshot_relationships"]
 
-        if self.companies:
-            loader.load_nodes("Company", self.companies, key_field="cnpj")
+        if companies:
+            loader.load_nodes("Company", companies, key_field="cnpj")
 
-        if self.partners:
-            loader.load_nodes("Person", self.partners, key_field="cpf")
+        if partners:
+            loader.load_nodes("Person", partners, key_field="cpf")
 
-        if self.partial_partners:
-            loader.load_nodes("Partner", self.partial_partners, key_field="partner_id")
+        if partial_partners:
+            loader.load_nodes("Partner", partial_partners, key_field="partner_id")
 
-        if self.relationships:
+        if relationships:
             loader.load_relationships(
                 rel_type="SOCIO_DE",
-                rows=self.relationships,
+                rows=relationships,
                 source_label="Person",
                 source_key="cpf",
                 target_label="Company",
@@ -1290,10 +1318,10 @@ class CNPJPipeline(Pipeline):
                 properties=["tipo_socio", "qualificacao", "data_entrada"],
             )
 
-        if self.partner_relationships:
+        if partner_relationships:
             loader.load_relationships(
                 rel_type="SOCIO_DE",
-                rows=self.partner_relationships,
+                rows=partner_relationships,
                 source_label="Partner",
                 source_key="partner_id",
                 target_label="Company",
@@ -1301,10 +1329,10 @@ class CNPJPipeline(Pipeline):
                 properties=["tipo_socio", "qualificacao", "data_entrada"],
             )
 
-        if self.pj_relationships:
+        if pj_relationships:
             loader.load_relationships(
                 rel_type="SOCIO_DE",
-                rows=self.pj_relationships,
+                rows=pj_relationships,
                 source_label="Company",
                 source_key="cnpj",
                 target_label="Company",
@@ -1312,5 +1340,5 @@ class CNPJPipeline(Pipeline):
                 properties=["tipo_socio", "qualificacao", "data_entrada"],
             )
 
-        if self.snapshot_relationships:
-            self._load_snapshot_relationship_rows(loader, self.snapshot_relationships)
+        if snapshot_relationships:
+            self._load_snapshot_relationship_rows(loader, snapshot_relationships)

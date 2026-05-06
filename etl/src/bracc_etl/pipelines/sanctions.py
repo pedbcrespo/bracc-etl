@@ -34,35 +34,31 @@ class SanctionsPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_ceis: pd.DataFrame = pd.DataFrame()
-        self._raw_cnep: pd.DataFrame = pd.DataFrame()
-        self.sanctions: list[dict[str, Any]] = []
-        self.sanctioned_entities: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         sanctions_dir = Path(self.data_dir) / "sanctions"
+        raw_ceis: pd.DataFrame = pd.DataFrame()
+        raw_cnep: pd.DataFrame = pd.DataFrame()
         if not sanctions_dir.exists():
             logger.warning("[%s] Data directory not found: %s", self.name, sanctions_dir)
-            return
+            return {"raw_ceis": pd.DataFrame(), "raw_cnep": pd.DataFrame()}
         ceis_path = sanctions_dir / "ceis.csv"
         cnep_path = sanctions_dir / "cnep.csv"
         if not ceis_path.exists() or not cnep_path.exists():
             logger.warning("[%s] Required CSV files not found in %s", self.name, sanctions_dir)
-            return
-        self._raw_ceis = pd.read_csv(
-            ceis_path, dtype=str, encoding="latin-1", keep_default_na=False,
+            return {"raw_ceis": pd.DataFrame(), "raw_cnep": pd.DataFrame()}
+        raw_ceis = pd.read_csv(
+            ceis_path, dtype=str, encoding="latin-1", keep_default_na=False, chunksize=self.chunk_size
         )
-        self._raw_cnep = pd.read_csv(
-            cnep_path, dtype=str, encoding="latin-1", keep_default_na=False,
+        raw_cnep = pd.read_csv(
+            cnep_path, dtype=str, encoding="latin-1", keep_default_na=False, chunksize=self.chunk_size
         )
+        return {"raw_ceis": raw_ceis, "raw_cnep": raw_cnep}
 
-    def _process_rows(
-        self, df: pd.DataFrame, sanction_type: str
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _process_rows(self, df: pd.DataFrame, sanction_type: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         sanctions: list[dict[str, Any]] = []
         entities: list[dict[str, Any]] = []
 
@@ -107,23 +103,28 @@ class SanctionsPipeline(Pipeline):
 
         return sanctions, entities
 
-    def transform(self) -> None:
-        ceis_sanctions, ceis_entities = self._process_rows(self._raw_ceis, "CEIS")
-        cnep_sanctions, cnep_entities = self._process_rows(self._raw_cnep, "CNEP")
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        raw_ceis = data["raw_ceis"]
+        raw_cnep = data["raw_cnep"]
+
+        ceis_sanctions, ceis_entities = self._process_rows(raw_ceis, "CEIS")
+        cnep_sanctions, cnep_entities = self._process_rows(raw_cnep, "CNEP")
 
         all_sanctions = ceis_sanctions + cnep_sanctions
         all_entities = ceis_entities + cnep_entities
 
-        self.sanctions = deduplicate_rows(all_sanctions, ["sanction_id"])
-        self.sanctioned_entities = all_entities
+        return {
+            "sanctions": deduplicate_rows(all_sanctions, ["sanction_id"]), 
+            "entities": all_entities
+        }
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.sanctions:
-            loader.load_nodes("Sanction", self.sanctions, key_field="sanction_id")
+        if data["sanctions"]:
+            loader.load_nodes("Sanction", data["sanctions"], key_field="sanction_id")
 
-        for ent in self.sanctioned_entities:
+        for ent in data["entities"]:
             label = ent["entity_label"]
             key_field = ent["entity_key_field"]
             doc = ent["entity_doc"]
@@ -134,10 +135,10 @@ class SanctionsPipeline(Pipeline):
                 node_row["razao_social"] = name
             loader.load_nodes(label, [node_row], key_field=key_field)
 
-        if self.sanctioned_entities:
+        if data["sanctions"]:
             rel_rows = [
                 {"source_key": e["source_key"], "target_key": e["target_key"]}
-                for e in self.sanctioned_entities
+                for e in data["sanctions"]
             ]
 
             query = (
@@ -149,4 +150,4 @@ class SanctionsPipeline(Pipeline):
                 "WHERE entity IS NOT NULL "
                 "MERGE (entity)-[:SANCIONADA]->(s)"
             )
-            loader.run_query_with_retry(query, rel_rows)
+            loader.run_query(query, rel_rows)

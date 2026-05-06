@@ -63,17 +63,10 @@ class SenadoPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self._senator_lookup: dict[str, dict[str, str]] = {}
-        self.expenses: list[dict[str, Any]] = []
-        self.suppliers: list[dict[str, Any]] = []
-        self.gastou_rels: list[dict[str, Any]] = []
-        self.gastou_by_name_rels: list[dict[str, Any]] = []
-        self.forneceu_rels: list[dict[str, Any]] = []
 
     def _load_senator_lookup(self) -> dict[str, dict[str, str]]:
         """Load senator identity lookup from parlamentares.json.
@@ -114,16 +107,16 @@ class SenadoPipeline(Pipeline):
         )
         return lookup
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         senado_dir = Path(self.data_dir) / "senado"
 
         # Load senator identity lookup for CPF enrichment
         self._senator_lookup = self._load_senator_lookup()
-
+        raw: pd.DataFrame = pd.DataFrame()
         csv_files = sorted(senado_dir.glob("*.csv"))
         if not csv_files:
             logger.warning("No CSV files found in %s", senado_dir)
-            return
+            return pd.DataFrame()
 
         frames: list[pd.DataFrame] = []
         for f in csv_files:
@@ -138,11 +131,12 @@ class SenadoPipeline(Pipeline):
             frames.append(df)
             logger.info("  Loaded %d rows from %s", len(df), f.name)
 
-        self._raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        logger.info("Total raw rows: %d", len(self._raw))
+        raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        logger.info("Total raw rows: %d", len(raw))
+        return raw
 
-    def transform(self) -> None:
-        if self._raw.empty:
+    def transform(self, raw: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+        if raw.empty:
             return
 
         expenses: list[dict[str, Any]] = []
@@ -152,7 +146,7 @@ class SenadoPipeline(Pipeline):
         forneceu: list[dict[str, Any]] = []
         skipped = 0
 
-        for _, row in self._raw.iterrows():
+        for _, row in raw.iterrows():
             senator_name = normalize_name(str(row.get("SENADOR", "")))
             expense_type = str(row.get("TIPO_DESPESA", "")).strip()
 
@@ -225,31 +219,45 @@ class SenadoPipeline(Pipeline):
                 "target_key": expense_id,
             })
 
-        self.expenses = deduplicate_rows(expenses, ["expense_id"])
-        self.suppliers = list(suppliers_map.values())
-        self.gastou_rels = gastou
-        self.gastou_by_name_rels = gastou_by_name
-        self.forneceu_rels = forneceu
+        expenses = deduplicate_rows(expenses, ["expense_id"])
+        suppliers = list(suppliers_map.values())
+        gastou_rels = gastou
+        gastou_by_name_rels = gastou_by_name
+        forneceu_rels = forneceu
 
         if self.limit:
-            self.expenses = self.expenses[: self.limit]
+            expenses = expenses[: self.limit]
 
         logger.info(
             "Transformed: %d expenses, %d suppliers, "
             "%d GASTOU (CPF) + %d GASTOU (name) (skipped %d)",
-            len(self.expenses),
-            len(self.suppliers),
-            len(self.gastou_rels),
-            len(self.gastou_by_name_rels),
+            len(expenses),
+            len(suppliers),
+            len(gastou_rels),
+            len(gastou_by_name_rels),
             skipped,
         )
 
-    def load(self) -> None:
-        if not self.expenses:
+        return {
+            "expenses": expenses,
+            "suppliers": suppliers,
+            "gastou_rels": gastou_rels,
+            "gastou_by_name_rels": gastou_by_name_rels,
+            "forneceu_rels": forneceu_rels,
+        }
+
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        expenses = data.get("expenses", [])
+        suppliers = data.get("suppliers", [])
+        gastou_rels = data.get("gastou_rels", [])
+        gastou_by_name_rels = data.get("gastou_by_name_rels", [])
+        forneceu_rels = data.get("forneceu_rels", [])
+
+        if not expenses:
             logger.warning("No expenses to load")
             return
 
-        loader = Neo4jBatchLoader(self.driver, batch_size=500)
+        loader = Neo4jBatchLoader(self.driver)
 
         # Load Expense nodes
         expense_nodes = [
@@ -261,29 +269,29 @@ class SenadoPipeline(Pipeline):
                 "description": e["description"],
                 "source": e["source"],
             }
-            for e in self.expenses
+            for e in expenses
         ]
         count = loader.load_nodes("Expense", expense_nodes, key_field="expense_id")
         logger.info("Loaded %d Expense nodes", count)
 
         # Load/merge Company nodes for CNPJ suppliers
-        company_suppliers = [s for s in self.suppliers if "cnpj" in s]
+        company_suppliers = [s for s in suppliers if "cnpj" in s]
         if company_suppliers:
             count = loader.load_nodes("Company", company_suppliers, key_field="cnpj")
             logger.info("Merged %d supplier Company nodes", count)
 
         # Load/merge Person nodes for CPF suppliers
-        person_suppliers = [s for s in self.suppliers if "cpf" in s]
+        person_suppliers = [s for s in suppliers if "cpf" in s]
         if person_suppliers:
             count = loader.load_nodes("Person", person_suppliers, key_field="cpf")
             logger.info("Merged %d supplier Person nodes", count)
 
         # GASTOU: Person (senator) -> Expense
         # Tier 1: CPF-based (from senator lookup enrichment)
-        if self.gastou_rels:
+        if gastou_rels:
             count = loader.load_relationships(
                 rel_type="GASTOU",
-                rows=self.gastou_rels,
+                rows=gastou_rels,
                 source_label="Person",
                 source_key="cpf",
                 target_label="Expense",
@@ -293,18 +301,18 @@ class SenadoPipeline(Pipeline):
 
         # Tier 2: Name-based (no CANDIDATO_EM filter — matches suplentes and
         # pre-2002 senators who lack TSE candidacy records)
-        if self.gastou_by_name_rels:
+        if gastou_by_name_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (e:Expense {expense_id: row.target_key}) "
                 "MATCH (p:Person {name: row.senator_name}) "
                 "MERGE (p)-[:GASTOU]->(e)"
             )
-            count = loader.run_query_with_retry(query, self.gastou_by_name_rels)
+            count = loader.run_query(query, gastou_by_name_rels)
             logger.info("Created %d GASTOU relationships (name)", count)
 
         # FORNECEU: Company/Person -> Expense
-        if self.forneceu_rels:
+        if forneceu_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (e:Expense {expense_id: row.target_key}) "
@@ -314,5 +322,8 @@ class SenadoPipeline(Pipeline):
                 "WHERE supplier IS NOT NULL "
                 "MERGE (supplier)-[:FORNECEU]->(e)"
             )
-            count = loader.run_query_with_retry(query, self.forneceu_rels)
+            count = loader.run_query(query, forneceu_rels)
             logger.info("Created %d FORNECEU relationships", count)
+
+        del self._load_senator_lookup
+    

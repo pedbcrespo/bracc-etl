@@ -49,32 +49,24 @@ class DatajudPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-        self._raw_cases: pd.DataFrame = pd.DataFrame()
-        self._raw_parties: pd.DataFrame = pd.DataFrame()
-
-        self.cases: list[dict[str, Any]] = []
-        self.persons: list[dict[str, Any]] = []
-        self.companies: list[dict[str, Any]] = []
-        self.person_case_rels: list[dict[str, Any]] = []
-        self.company_case_rels: list[dict[str, Any]] = []
-
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         src_dir = Path(self.data_dir) / "datajud"
         cases_csv = src_dir / "cases.csv"
         parties_csv = src_dir / "parties.csv"
 
+        dict_results: dict[str, pd.DataFrame] = {}
+
         if cases_csv.exists():
-            self._raw_cases = pd.read_csv(cases_csv, dtype=str, keep_default_na=False)
+            dict_results["raw_cases"] = pd.read_csv(cases_csv, dtype=str, keep_default_na=False)
 
         if parties_csv.exists():
-            self._raw_parties = pd.read_csv(parties_csv, dtype=str, keep_default_na=False)
+            dict_results["raw_parties"] = pd.read_csv(parties_csv, dtype=str, keep_default_na=False)
 
-        if self._raw_cases.empty and not cases_csv.exists():
+        if dict_results["raw_cases"].empty and not cases_csv.exists():
             dry_run_manifest = src_dir / "dry_run_manifest.json"
             if dry_run_manifest.exists():
                 try:
@@ -87,25 +79,29 @@ class DatajudPipeline(Pipeline):
                     logger.info("[datajud] dry-run mode: manifest present")
 
         if self.limit:
-            self._raw_cases = self._raw_cases.head(self.limit)
-            self._raw_parties = self._raw_parties.head(self.limit)
+            dict_results["raw_cases"] = dict_results["raw_cases"].head(self.limit)
+            dict_results["raw_parties"] = dict_results["raw_parties"].head(self.limit)
 
         logger.info(
             "[datajud] extracted cases=%d parties=%d",
-            len(self._raw_cases),
-            len(self._raw_parties),
+            len(dict_results["raw_cases"]),
+            len(dict_results["raw_parties"]),
         )
+        return dict_results
 
-    def transform(self) -> None:
-        if not self._raw_cases.empty:
-            self._transform_cases()
-        if not self._raw_parties.empty:
-            self._transform_parties()
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        dict_results: dict[str, list[dict[str, Any]]] = {}
+        if not data["raw_cases"].empty:
+            dict_results["cases"] = self._transform_cases(data["raw_cases"])
+        if not data["raw_parties"].empty:
+            result = self._transform_parties(data["raw_parties"])
+            dict_results.update(result)
+        return dict_results
 
-    def _transform_cases(self) -> None:
+    def _transform_cases(self, data: pd.DataFrame) -> list[dict[str, Any]]:
         cases: list[dict[str, Any]] = []
 
-        for _, row in self._raw_cases.iterrows():
+        for _, row in data.iterrows():
             case_id = _pick(row, "judicial_case_id", "case_id", "id")
             case_number = _pick(row, "case_number", "numero_processo")
             court = _pick(row, "court", "tribunal")
@@ -132,15 +128,15 @@ class DatajudPipeline(Pipeline):
                 "source": "datajud",
             })
 
-        self.cases = deduplicate_rows(cases, ["judicial_case_id"])
+        return deduplicate_rows(cases, ["judicial_case_id"])
 
-    def _transform_parties(self) -> None:
+    def _transform_parties(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         persons: list[dict[str, Any]] = []
         companies: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw_parties.iterrows():
+        for _, row in data.iterrows():
             case_id = _pick(row, "judicial_case_id", "case_id", "id_processo")
             if not case_id:
                 continue
@@ -168,27 +164,33 @@ class DatajudPipeline(Pipeline):
                     "role": role,
                 })
 
-        self.persons = deduplicate_rows(persons, ["cpf"])
-        self.companies = deduplicate_rows(companies, ["cnpj"])
-        self.person_case_rels = deduplicate_rows(person_rels, ["source_key", "target_key", "role"])
-        self.company_case_rels = deduplicate_rows(
+        persons = deduplicate_rows(persons, ["cpf"])
+        companies = deduplicate_rows(companies, ["cnpj"])
+        person_rels = deduplicate_rows(person_rels, ["source_key", "target_key", "role"])
+        company_rels = deduplicate_rows(
             company_rels,
             ["source_key", "target_key", "role"],
         )
+        return {
+            "persons": persons,
+            "companies": companies,
+            "person_case_rels": person_rels,
+            "company_case_rels": company_rels,
+        }
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.cases:
-            loader.load_nodes("JudicialCase", self.cases, key_field="judicial_case_id")
+        if data.get("cases"):
+            loader.load_nodes("JudicialCase", data["cases"], key_field="judicial_case_id")
 
-        if self.persons:
-            loader.load_nodes("Person", self.persons, key_field="cpf")
+        if data.get("persons"):
+            loader.load_nodes("Person", data["persons"], key_field="cpf")
 
-        if self.companies:
-            loader.load_nodes("Company", self.companies, key_field="cnpj")
+        if data.get("companies"):
+            loader.load_nodes("Company", data["companies"], key_field="cnpj")
 
-        if self.person_case_rels:
+        if data.get("person_case_rels"):
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
@@ -196,9 +198,9 @@ class DatajudPipeline(Pipeline):
                 "MERGE (p)-[r:PARTE_PROCESSO]->(j) "
                 "SET r.role = row.role"
             )
-            loader.run_query_with_retry(query, self.person_case_rels)
+            loader.run_query_with_retry(query, data["person_case_rels"])
 
-        if self.company_case_rels:
+        if data.get("company_case_rels"):
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (c:Company {cnpj: row.source_key}) "
@@ -206,4 +208,4 @@ class DatajudPipeline(Pipeline):
                 "MERGE (c)-[r:PARTE_PROCESSO]->(j) "
                 "SET r.role = row.role"
             )
-            loader.run_query_with_retry(query, self.company_case_rels)
+            loader.run_query_with_retry(query, data["company_case_rels"])

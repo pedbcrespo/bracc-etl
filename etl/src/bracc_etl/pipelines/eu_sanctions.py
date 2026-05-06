@@ -75,44 +75,42 @@ class EuSanctionsPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.sanctions: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         eu_dir = Path(self.data_dir) / "eu_sanctions"
         csv_path = eu_dir / "eu_sanctions.csv"
-
+        raw: pd.DataFrame = pd.DataFrame()
         if not csv_path.exists():
             logger.warning("[eu_sanctions] eu_sanctions.csv not found at %s", csv_path)
-            return
+            return pd.DataFrame()
 
         logger.info("[eu_sanctions] Reading %s", csv_path)
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             encoding="utf-8-sig",
             keep_default_na=False,
             on_bad_lines="skip",
             sep=";",
+            chunksize=self.chunk_size,
         )
 
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw = raw.head(self.limit)
 
-        logger.info("[eu_sanctions] Extracted %d rows", len(self._raw))
+        logger.info("[eu_sanctions] Extracted %d rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         sanctions: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
+        dict_results: dict[str, list[dict[str, Any]]] = {}
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             # Support both old column names and new EU consolidated format
             name_raw = str(
                 row.get("NameAlias_WholeName")
@@ -175,38 +173,43 @@ class EuSanctionsPipeline(Pipeline):
             elif entity_type == EU_TYPE_ENTERPRISE:
                 company_rels.append(rel)
 
-        self.sanctions = deduplicate_rows(sanctions, ["sanction_id"])
-        self.person_rels = deduplicate_rows(person_rels, ["sanction_id"])
-        self.company_rels = deduplicate_rows(company_rels, ["sanction_id"])
+
+        dict_results = {
+            "sanctions": deduplicate_rows(sanctions, ["sanction_id"]),
+            "person_rels": deduplicate_rows(person_rels, ["sanction_id"]),
+            "company_rels": deduplicate_rows(company_rels, ["sanction_id"]),
+        }
 
         logger.info(
             "[eu_sanctions] Transformed %d InternationalSanction nodes "
             "(%d person rels, %d company rels)",
-            len(self.sanctions),
-            len(self.person_rels),
-            len(self.company_rels),
+            len(dict_results["sanctions"]),
+            len(dict_results["person_rels"]),
+            len(dict_results["company_rels"]),
         )
 
-    def load(self) -> None:
+        return dict_results
+
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.sanctions:
+        if data["sanctions"]:
             loaded = loader.load_nodes(
-                "InternationalSanction", self.sanctions, key_field="sanction_id"
+                "InternationalSanction", data["sanctions"], key_field="sanction_id"
             )
             logger.info("[eu_sanctions] Loaded %d InternationalSanction nodes", loaded)
 
-        if self.person_rels:
+        if data["person_rels"]:
             count = loader.run_query_with_retry(
-                MATCH_PERSON_QUERY, self.person_rels
+                MATCH_PERSON_QUERY, data["person_rels"]
             )
             logger.info(
                 "[eu_sanctions] Created %d Person SANCIONADA_INT rels", count
             )
 
-        if self.company_rels:
+        if data["company_rels"]:
             count = loader.run_query_with_retry(
-                MATCH_COMPANY_QUERY, self.company_rels
+                MATCH_COMPANY_QUERY, data["company_rels"]
             )
             logger.info(
                 "[eu_sanctions] Created %d Company SANCIONADA_INT rels", count

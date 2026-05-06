@@ -66,20 +66,15 @@ class SiopPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.amendments: list[dict[str, Any]] = []
-        self.authors: list[dict[str, Any]] = []
-        self.author_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         siop_dir = Path(self.data_dir) / "siop"
         csv_files = sorted(siop_dir.glob("*.csv"))
         if not csv_files:
-            return
+            return pd.DataFrame()
 
         frames: list[pd.DataFrame] = []
         for csv_path in csv_files:
@@ -89,10 +84,11 @@ class SiopPipeline(Pipeline):
                 encoding="latin-1",
                 sep=";",
                 keep_default_na=False,
+                chunksize=self.chunk_size,
             )
             frames.append(df)
 
-        self._raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     @staticmethod
     def _resolve_col(row: Any, *candidates: str) -> str:
@@ -103,9 +99,9 @@ class SiopPipeline(Pipeline):
                 return str(val).strip()
         return ""
 
-    def transform(self) -> None:
-        if self._raw.empty:
-            return
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+        if data.empty:
+            return {}
 
         amendments: list[dict[str, Any]] = []
         authors: list[dict[str, Any]] = []
@@ -114,13 +110,13 @@ class SiopPipeline(Pipeline):
         # Detect the amendment code column (two naming conventions)
         col_code: str | None = None
         for candidate in ("CÓDIGO EMENDA", "Código da Emenda"):
-            if candidate in self._raw.columns:
+            if candidate in data.columns:
                 col_code = candidate
                 break
         if col_code is None:
             return
 
-        grouped = self._raw.groupby(col_code)
+        grouped = data.groupby(col_code)
 
         for code, group in grouped:
             code_str = str(code).strip()
@@ -211,27 +207,29 @@ class SiopPipeline(Pipeline):
                     "target_key": amendment_id,
                 })
 
-        self.amendments = deduplicate_rows(amendments, ["amendment_id"])
-        self.authors = deduplicate_rows(authors, ["cpf"])
-        self.author_rels = author_rels
+        return {
+            "amendments": deduplicate_rows(amendments, ["amendment_id"]),
+            "authors": deduplicate_rows(authors, ["cpf"]),
+            "author_rels": author_rels
+        }
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=500)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
         # 1. Amendment nodes
-        if self.amendments:
-            loader.load_nodes("Amendment", self.amendments, key_field="amendment_id")
+        if data.get("amendments"):
+            loader.load_nodes("Amendment", data["amendments"], key_field="amendment_id")
 
         # 2. Person nodes for authors with CPF
-        if self.authors:
-            loader.load_nodes("Person", self.authors, key_field="cpf")
+        if data.get("authors"):
+            loader.load_nodes("Person", data["authors"], key_field="cpf")
 
         # 3. Person -[:AUTOR_EMENDA]-> Amendment
-        if self.author_rels:
+        if data.get("author_rels"):
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
                 "MATCH (a:Amendment {amendment_id: row.target_key}) "
                 "MERGE (p)-[:AUTOR_EMENDA]->(a)"
             )
-            loader.run_query_with_retry(query, self.author_rels)
+            loader.run_query_with_retry(query, data["author_rels"])

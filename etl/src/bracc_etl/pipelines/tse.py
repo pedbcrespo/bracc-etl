@@ -38,46 +38,51 @@ class TSEPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self.candidates: list[dict[str, Any]] = []
-        self.donations: list[dict[str, Any]] = []
-        self.elections: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         tse_dir = Path(self.data_dir) / "tse"
+        dict_result: dict[str, pd.DataFrame] = {}
         if not tse_dir.exists():
             logger.warning("[%s] Data directory not found: %s", self.name, tse_dir)
-            self._raw_candidatos = pd.DataFrame()
-            self._raw_doacoes = pd.DataFrame()
+            dict_result["raw_candidatos"] = pd.DataFrame()
+            dict_result["raw_doacoes"] = pd.DataFrame()
             return
         candidatos_path = tse_dir / "candidatos.csv"
         doacoes_path = tse_dir / "doacoes.csv"
         if not candidatos_path.exists() or not doacoes_path.exists():
             logger.warning("[%s] Required CSV files not found in %s", self.name, tse_dir)
-            self._raw_candidatos = pd.DataFrame()
-            self._raw_doacoes = pd.DataFrame()
+            dict_result["raw_candidatos"] = pd.DataFrame()
+            dict_result["raw_doacoes"] = pd.DataFrame()
             return
-        self._raw_candidatos = pd.read_csv(
+        dict_result["raw_candidatos"] = pd.read_csv(
             candidatos_path, encoding="latin-1", dtype=str,
             nrows=self.limit,
+            chunksize=self.chunk_size,
         )
-        self._raw_doacoes = pd.read_csv(
+        dict_result["raw_doacoes"] = pd.read_csv(
             doacoes_path, encoding="latin-1", dtype=str,
             nrows=self.limit,
         )
 
-    def transform(self) -> None:
-        self._transform_candidates()
-        self._transform_donations()
+        return dict_result
 
-    def _transform_candidates(self) -> None:
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+
+        dict_result.update(self._transform_candidates(data))
+        dict_result.update(self._transform_donations(data))
+
+        return dict_result
+
+    def _transform_candidates(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
         candidates: list[dict[str, Any]] = []
         elections: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-        for _, row in self._raw_candidatos.iterrows():
+        for _, row in data["raw_candidatos"].iterrows():
             sq = str(row["sq_candidato"]).strip()
             raw_cpf = str(row["cpf"]).strip()
             name = normalize_name(str(row["nome"]))
@@ -109,16 +114,17 @@ class TSEPipeline(Pipeline):
                 "municipio": municipio,
                 "candidate_sq": sq,
             })
+        dict_result = {
+            "candidates": deduplicate_rows(candidates, ["sq_candidato"]),
+            "elections": deduplicate_rows(elections, ["year", "cargo", "uf", "municipio", "candidate_sq"]),
+        }
+        return dict_result
 
-        self.candidates = deduplicate_rows(candidates, ["sq_candidato"])
-        self.elections = deduplicate_rows(
-            elections, ["year", "cargo", "uf", "municipio", "candidate_sq"]
-        )
-
-    def _transform_donations(self) -> None:
+    def _transform_donations(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
         donations: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
-        for _, row in self._raw_doacoes.iterrows():
+        for _, row in data["raw_doacoes"].iterrows():
             candidate_sq = str(row["sq_candidato"]).strip()
             donor_doc = strip_document(str(row["cpf_cnpj_doador"]))
             donor_name = normalize_name(str(row["nome_doador"]))
@@ -139,14 +145,15 @@ class TSEPipeline(Pipeline):
                 "year": ano,
             })
 
-        self.donations = donations
+        dict_result = {"donations": donations}
+        return dict_result
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=500)
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
         # Split candidates: CPF-keyed (dedup by CPF) vs sq_candidato-only
-        cpf_candidates = [c for c in self.candidates if c.get("cpf")]
-        nocpf_candidates = [c for c in self.candidates if not c.get("cpf")]
+        cpf_candidates = [c for c in data["candidates"] if c.get("cpf")]
+        nocpf_candidates = [c for c in data["candidates"] if not c.get("cpf")]
 
         # Merge by CPF, also store sq_candidato as a list for cross-referencing
         if cpf_candidates:
@@ -159,14 +166,14 @@ class TSEPipeline(Pipeline):
 
         # Build sq_candidato→cpf lookup for linking
         sq_to_cpf: dict[str, str] = {}
-        for c in self.candidates:
+        for c in data["candidates"]:
             if c.get("cpf"):
                 sq_to_cpf[c["sq_candidato"]] = c["cpf"]
 
         # Map sq_candidato to Person node via Cypher SET for CANDIDATO_EM linking
         sq_cpf_rows = [{"sq": sq, "cpf": cpf} for sq, cpf in sq_to_cpf.items()]
         if sq_cpf_rows:
-            loader.run_query_with_retry(
+            loader.run_query(
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.cpf}) "
                 "SET p.sq_candidato = row.sq",
@@ -177,12 +184,12 @@ class TSEPipeline(Pipeline):
         election_nodes = deduplicate_rows(
             [
                 {"year": e["year"], "cargo": e["cargo"], "uf": e["uf"], "municipio": e["municipio"]}
-                for e in self.elections
+                for e in data["elections"]
             ],
             ["year", "cargo", "uf", "municipio"],
         )
         if election_nodes:
-            loader.run_query_with_retry(
+            loader.run_query(
                 "UNWIND $rows AS row "
                 "MERGE (e:Election {year: row.year, cargo: row.cargo, "
                 "uf: row.uf, municipio: row.municipio})",
@@ -191,7 +198,7 @@ class TSEPipeline(Pipeline):
 
         # CANDIDATO_EM relationships — find person by CPF first, fallback to sq_candidato
         candidato_rels = []
-        for e in self.elections:
+        for e in data["elections"]:
             rel: dict[str, Any] = {
                 "target_year": e["year"],
                 "target_cargo": e["cargo"],
@@ -208,7 +215,7 @@ class TSEPipeline(Pipeline):
             candidato_rels.append(rel)
 
         if candidato_rels:
-            loader.run_query_with_retry(
+            loader.run_query(
                 "UNWIND $rows AS row "
                 "OPTIONAL MATCH (p1:Person {cpf: row.cpf}) WHERE row.cpf <> '' "
                 "OPTIONAL MATCH (p2:Person {sq_candidato: row.sq}) WHERE row.sq <> '' "
@@ -223,12 +230,12 @@ class TSEPipeline(Pipeline):
         # Donor nodes and DOOU relationships
         person_donors = [
             {"cpf": d["donor_doc"], "name": d["donor_name"]}
-            for d in self.donations
+            for d in data["donations"]
             if not d["donor_is_company"]
         ]
         company_donors = [
             {"cnpj": d["donor_doc"], "name": d["donor_name"], "razao_social": d["donor_name"]}
-            for d in self.donations
+            for d in data["donations"]
             if d["donor_is_company"]
         ]
 
@@ -241,7 +248,7 @@ class TSEPipeline(Pipeline):
 
         # DOOU from Person donors → candidate
         person_donation_rels = []
-        for d in self.donations:
+        for d in data["donations"]:
             if d["donor_is_company"]:
                 continue
             target_cpf = sq_to_cpf.get(d["candidate_sq"], "")
@@ -253,7 +260,7 @@ class TSEPipeline(Pipeline):
                 "year": d["year"],
             })
         if person_donation_rels:
-            loader.run_query_with_retry(
+            loader.run_query(
                 "UNWIND $rows AS row "
                 "MATCH (d:Person {cpf: row.source_key}) "
                 "OPTIONAL MATCH (c1:Person {cpf: row.target_cpf}) WHERE row.target_cpf <> '' "
@@ -268,7 +275,7 @@ class TSEPipeline(Pipeline):
 
         # DOOU from Company donors → candidate
         company_donation_rels = []
-        for d in self.donations:
+        for d in data["donations"]:
             if not d["donor_is_company"]:
                 continue
             target_cpf = sq_to_cpf.get(d["candidate_sq"], "")
@@ -280,7 +287,7 @@ class TSEPipeline(Pipeline):
                 "year": d["year"],
             })
         if company_donation_rels:
-            loader.run_query_with_retry(
+            loader.run_query(
                 "UNWIND $rows AS row "
                 "MATCH (d:Company {cnpj: row.source_key}) "
                 "OPTIONAL MATCH (c1:Person {cpf: row.target_cpf}) WHERE row.target_cpf <> '' "

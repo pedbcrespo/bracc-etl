@@ -46,12 +46,8 @@ class CvmFundsPipeline(Pipeline):
         **kwargs: Any,
     ) -> None:
         super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.funds: list[dict[str, Any]] = []
-        self.admin_rels: list[dict[str, Any]] = []
-        self.manager_rels: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         cvm_funds_dir = Path(self.data_dir) / "cvm_funds"
         csv_path = cvm_funds_dir / "cad_fi.csv"
 
@@ -59,22 +55,26 @@ class CvmFundsPipeline(Pipeline):
             msg = f"CVM fund registry file not found: {csv_path}"
             raise FileNotFoundError(msg)
 
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             sep=";",
             dtype=str,
             keep_default_na=False,
             encoding="latin-1",
+            chunksize=self.chunk_size,
         )
 
-        logger.info("[cvm_funds] Extracted %d rows from cad_fi.csv", len(self._raw))
+        logger.info("[cvm_funds] Extracted %d rows from cad_fi.csv", len(raw))
+        return raw  
 
-    def transform(self) -> None:
+    def transform(self, data:pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         funds: list[dict[str, Any]] = []
         admin_rels: list[dict[str, Any]] = []
         manager_rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+
+        for _, row in data.iterrows():
             # Fund CNPJ
             fund_cnpj_raw = str(row.get("CNPJ_FUNDO", "")).strip()
             fund_digits = strip_document(fund_cnpj_raw)
@@ -133,10 +133,10 @@ class CvmFundsPipeline(Pipeline):
                     "manager_name": manager_name,
                 })
 
-        self.funds = deduplicate_rows(funds, ["fund_cnpj"])
+        dict_result["funds"] = deduplicate_rows(funds, ["fund_cnpj"])
 
         if self.limit:
-            self.funds = self.funds[: self.limit]
+            dict_result["funds"] = dict_result["funds"][: self.limit]
 
         # Deduplicate rels based on source+target pair
         seen_admin: set[tuple[str, str]] = set()
@@ -146,7 +146,7 @@ class CvmFundsPipeline(Pipeline):
             if pair not in seen_admin:
                 seen_admin.add(pair)
                 deduped_admin.append(rel)
-        self.admin_rels = deduped_admin
+        dict_result["admin_rels"] = deduped_admin
 
         seen_mgr: set[tuple[str, str]] = set()
         deduped_mgr: list[dict[str, Any]] = []
@@ -155,23 +155,25 @@ class CvmFundsPipeline(Pipeline):
             if pair not in seen_mgr:
                 seen_mgr.add(pair)
                 deduped_mgr.append(rel)
-        self.manager_rels = deduped_mgr
+        dict_result["manager_rels"] = deduped_mgr
 
         logger.info(
             "[cvm_funds] Transformed: %d funds, %d ADMINISTRA rels, %d GERE rels",
-            len(self.funds),
-            len(self.admin_rels),
-            len(self.manager_rels),
+            len(dict_result["funds"]),
+            len(dict_result["admin_rels"]),
+            len(dict_result["manager_rels"]),
         )
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+        return dict_result
 
-        if self.funds:
-            loaded = loader.load_nodes("Fund", self.funds, key_field="fund_cnpj")
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
+
+        if data["funds"]:
+            loaded = loader.load_nodes("Fund", data["funds"], key_field="fund_cnpj")
             logger.info("[cvm_funds] Loaded %d Fund nodes", loaded)
 
-        if self.admin_rels:
+        if data["admin_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (c:Company {cnpj: row.source_key}) "
@@ -180,10 +182,10 @@ class CvmFundsPipeline(Pipeline):
                 "MATCH (f:Fund {fund_cnpj: row.target_key}) "
                 "MERGE (c)-[:ADMINISTRA]->(f)"
             )
-            loaded = loader.run_query_with_retry(query, self.admin_rels, batch_size=500)
+            loaded = loader.run_query_with_retry(query, data["admin_rels"], batch_size=500)
             logger.info("[cvm_funds] Loaded %d ADMINISTRA relationships", loaded)
 
-        if self.manager_rels:
+        if data["manager_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (c:Company {cnpj: row.source_key}) "
@@ -192,5 +194,5 @@ class CvmFundsPipeline(Pipeline):
                 "MATCH (f:Fund {fund_cnpj: row.target_key}) "
                 "MERGE (c)-[:GERE]->(f)"
             )
-            loaded = loader.run_query_with_retry(query, self.manager_rels, batch_size=500)
+            loaded = loader.run_query_with_retry(query, data["manager_rels"], batch_size=500)
             logger.info("[cvm_funds] Loaded %d GERE relationships", loaded)

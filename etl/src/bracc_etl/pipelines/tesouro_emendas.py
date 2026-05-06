@@ -61,43 +61,39 @@ class TesouroEmendasPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(
-            driver, data_dir, limit=limit,
-            chunk_size=chunk_size, **kwargs,
-        )
-        self._raw = pd.DataFrame()
-        self.transfers: list[dict[str, Any]] = []
-        self.companies: list[dict[str, Any]] = []
-        self.transfer_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs,)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         src_dir = Path(self.data_dir) / "tesouro_emendas"
+        raw: pd.DataFrame = pd.DataFrame()
         csv_path = src_dir / "emendas_tesouro.csv"
         if not csv_path.exists():
             msg = f"Tesouro Emendas CSV not found: {csv_path}"
             raise FileNotFoundError(msg)
 
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             encoding="latin-1",
             sep=";",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
         logger.info(
-            "[tesouro_emendas] Extracted %d records", len(self._raw),
+            "[tesouro_emendas] Extracted %d records", len(raw),
         )
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         # Rename columns so itertuples() produces valid attributes
-        df = self._raw.rename(columns=_COL_RENAME)
+        df = data.rename(columns=_COL_RENAME)
 
         transfers: list[dict[str, Any]] = []
         companies: list[dict[str, Any]] = []
         transfer_rels: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
 
         for row in df.itertuples(index=False):
             ob = str(getattr(row, "ob", "")).strip()
@@ -149,35 +145,35 @@ class TesouroEmendasPipeline(Pipeline):
 
             if self.limit and len(transfers) >= self.limit:
                 break
-
-        self.transfers = deduplicate_rows(transfers, ["transfer_id"])
-        self.companies = deduplicate_rows(companies, ["cnpj"])
-        self.transfer_rels = transfer_rels
+        dict_result["transfers"] = deduplicate_rows(transfers, ["transfer_id"])
+        dict_result["companies"] = deduplicate_rows(companies, ["cnpj"])
+        dict_result["transfer_rels"] = transfer_rels
 
         logger.info(
             "[tesouro_emendas] Transformed %d transfers, %d companies",
-            len(self.transfers),
-            len(self.companies),
+            len(dict_result["transfers"]),
+            len(dict_result["companies"]),
         )
+        return dict_result
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.transfers:
+        if data["transfers"]:
             loader.load_nodes(
-                "Payment", self.transfers, key_field="transfer_id",
+                "Payment", data["transfers"], key_field="transfer_id",
             )
 
-        if self.companies:
+        if data["companies"]:
             loader.load_nodes(
-                "Company", self.companies, key_field="cnpj",
+                "Company", data["companies"], key_field="cnpj",
             )
 
-        if self.transfer_rels:
+        if data["transfer_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Payment {transfer_id: row.source_key}) "
                 "MATCH (c:Company {cnpj: row.target_key}) "
                 "MERGE (p)-[:PAGO_PARA]->(c)"
             )
-            loader.run_query_with_retry(query, self.transfer_rels)
+            loader.run_query(query, data["transfer_rels"])

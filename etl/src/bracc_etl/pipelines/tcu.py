@@ -41,17 +41,9 @@ class TcuPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_inabilitados: pd.DataFrame = pd.DataFrame()
-        self._raw_inidoneos: pd.DataFrame = pd.DataFrame()
-        self._raw_irregulares: pd.DataFrame = pd.DataFrame()
-        self._raw_irregulares_eleitorais: pd.DataFrame = pd.DataFrame()
-        self.sanctions: list[dict[str, Any]] = []
-        self.sanctioned_persons: list[dict[str, Any]] = []
-        self.sanctioned_companies: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
     def _read_csv(self, path: Path) -> pd.DataFrame:
         return pd.read_csv(
@@ -61,36 +53,40 @@ class TcuPipeline(Pipeline):
             encoding="utf-8",
             keep_default_na=False,
             quotechar='"',
+            chunksize=self.chunk_size,
         )
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         tcu_dir = Path(self.data_dir) / "tcu"
-
-        self._raw_inabilitados = self._read_csv(
-            tcu_dir / "inabilitados-funcao-publica.csv"
-        )
-        self._raw_inidoneos = self._read_csv(
+        dict_result: dict[str, pd.DataFrame] = {}
+        dict_result["raw_inabilitados"] = self._read_csv(
+            tcu_dir / "inabilitados-funcao-publica.csv")
+        dict_result["raw_inidoneos"] = self._read_csv(
             tcu_dir / "licitantes-inidoneos.csv"
         )
-        self._raw_irregulares = self._read_csv(
+        dict_result["raw_irregulares"] = self._read_csv(
             tcu_dir / "resp-contas-julgadas-irregulares.csv"
         )
-        self._raw_irregulares_eleitorais = self._read_csv(
+        dict_result["raw_irregulares_eleitorais"] = self._read_csv(
             tcu_dir / "resp-contas-julgadas-irreg-implicacao-eleitoral.csv"
         )
 
         logger.info(
             "[tcu] Extracted: %d inabilitados, %d inidoneos, "
             "%d irregulares, %d irregulares eleitorais",
-            len(self._raw_inabilitados),
-            len(self._raw_inidoneos),
-            len(self._raw_irregulares),
-            len(self._raw_irregulares_eleitorais),
+            len(dict_result["raw_inabilitados"]),
+            len(dict_result["raw_inidoneos"]),
+            len(dict_result["raw_irregulares"]),
+            len(dict_result["raw_irregulares_eleitorais"]),
         )
 
-    def _process_inabilitados(self) -> None:
+        return dict_result
+
+    def _process_inabilitados(self, raw_inabilitados: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Persons barred from public office (CPF-only)."""
-        for idx, row in self._raw_inabilitados.iterrows():
+        sanctions: list[dict[str, Any]] = []
+        sanctioned_persons: list[dict[str, Any]] = []
+        for idx, row in raw_inabilitados.iterrows():
             cpf_raw = str(row["CPF"]).strip()
             digits = strip_document(cpf_raw)
             if len(digits) != 11:
@@ -107,7 +103,7 @@ class TcuPipeline(Pipeline):
             municipio = str(row["MUNICIPIO"]).strip()
 
             sanction_id = f"tcu_inabilitado_{digits}_{idx}"
-            self.sanctions.append({
+            sanctions.append({
                 "sanction_id": sanction_id,
                 "type": "tcu_inabilitado",
                 "court": "TCU",
@@ -121,15 +117,20 @@ class TcuPipeline(Pipeline):
                 "cargo": "",
                 "source": "tcu",
             })
-            self.sanctioned_persons.append({
+            sanctioned_persons.append({
                 "cpf": cpf,
                 "name": nome,
                 "sanction_id": sanction_id,
             })
 
-    def _process_inidoneos(self) -> None:
+        return {"sanctions": sanctions, "sanctioned_persons": sanctioned_persons}
+
+    def _process_inidoneos(self, raw_inidoneos: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Companies declared unfit for public bidding (CNPJ-only)."""
-        for idx, row in self._raw_inidoneos.iterrows():
+        sanctions: list[dict[str, Any]] = []
+        sanctioned_companies: list[dict[str, Any]] = []
+        sanctioned_persons: list[dict[str, Any]] = []
+        for idx, row in raw_inidoneos.iterrows():
             doc_raw = str(row["CPF_CNPJ"]).strip()
             digits = strip_document(doc_raw)
             nome = normalize_name(str(row["NOME"]))
@@ -142,7 +143,7 @@ class TcuPipeline(Pipeline):
             municipio = str(row["MUNICIPIO"]).strip()
 
             sanction_id = f"tcu_inidoneo_{digits}_{idx}"
-            self.sanctions.append({
+            sanctions.append({
                 "sanction_id": sanction_id,
                 "type": "tcu_inidoneo",
                 "court": "TCU",
@@ -159,7 +160,7 @@ class TcuPipeline(Pipeline):
 
             if len(digits) == 14:
                 cnpj = format_cnpj(doc_raw)
-                self.sanctioned_companies.append({
+                sanctioned_companies.append({
                     "cnpj": cnpj,
                     "razao_social": nome,
                     "name": nome,
@@ -167,15 +168,19 @@ class TcuPipeline(Pipeline):
                 })
             elif len(digits) == 11:
                 cpf = format_cpf(doc_raw)
-                self.sanctioned_persons.append({
+                sanctioned_persons.append({
                     "cpf": cpf,
                     "name": nome,
                     "sanction_id": sanction_id,
                 })
+        return {"sanctions": sanctions, "sanctioned_companies": sanctioned_companies, "sanctioned_persons": sanctioned_persons}
 
-    def _process_irregulares(self) -> None:
+    def _process_irregulares(self, raw_irregulares: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Persons with accounts judged irregular (may have CPF or CNPJ)."""
-        for idx, row in self._raw_irregulares.iterrows():
+        sanctions: list[dict[str, Any]] = []
+        sanctioned_companies: list[dict[str, Any]] = []
+        sanctioned_persons: list[dict[str, Any]] = []
+        for idx, row in raw_irregulares.iterrows():
             doc_raw = str(row["CPF_CNPJ"]).strip()
             digits = strip_document(doc_raw)
             nome = normalize_name(str(row["NOME"]))
@@ -186,7 +191,7 @@ class TcuPipeline(Pipeline):
             municipio = str(row["MUNICIPIO"]).strip()
 
             sanction_id = f"tcu_irregular_{digits}_{idx}"
-            self.sanctions.append({
+            sanctions.append({
                 "sanction_id": sanction_id,
                 "type": "tcu_conta_irregular",
                 "court": "TCU",
@@ -203,7 +208,7 @@ class TcuPipeline(Pipeline):
 
             if len(digits) == 14:
                 cnpj = format_cnpj(doc_raw)
-                self.sanctioned_companies.append({
+                sanctioned_companies.append({
                     "cnpj": cnpj,
                     "razao_social": nome,
                     "name": nome,
@@ -211,15 +216,19 @@ class TcuPipeline(Pipeline):
                 })
             elif len(digits) == 11:
                 cpf = format_cpf(doc_raw)
-                self.sanctioned_persons.append({
+                sanctioned_persons.append({
                     "cpf": cpf,
                     "name": nome,
                     "sanction_id": sanction_id,
                 })
+        return {"sanctions": sanctions, "sanctioned_companies": sanctioned_companies, "sanctioned_persons": sanctioned_persons}
 
-    def _process_irregulares_eleitorais(self) -> None:
+    def _process_irregulares_eleitorais(self, raw_irregulares_eleitorais: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         """Persons with irregular accounts and electoral implication (CPF-only)."""
-        for idx, row in self._raw_irregulares_eleitorais.iterrows():
+        sanctions: list[dict[str, Any]] = []
+        sanctioned_persons: list[dict[str, Any]] = []
+
+        for idx, row in raw_irregulares_eleitorais.iterrows():
             cpf_raw = str(row["CPF"]).strip()
             digits = strip_document(cpf_raw)
             if len(digits) != 11:
@@ -236,7 +245,7 @@ class TcuPipeline(Pipeline):
             cargo = str(row.get("CARGO/FUNCAO", "")).strip()
 
             sanction_id = f"tcu_irregular_eleitoral_{digits}_{idx}"
-            self.sanctions.append({
+            sanctions.append({
                 "sanction_id": sanction_id,
                 "type": "tcu_conta_irregular_eleitoral",
                 "court": "TCU",
@@ -250,39 +259,54 @@ class TcuPipeline(Pipeline):
                 "cargo": cargo,
                 "source": "tcu",
             })
-            self.sanctioned_persons.append({
+            sanctioned_persons.append({
                 "cpf": cpf,
                 "name": nome,
                 "sanction_id": sanction_id,
             })
 
-    def transform(self) -> None:
-        self._process_inabilitados()
-        self._process_inidoneos()
-        self._process_irregulares()
-        self._process_irregulares_eleitorais()
+        return {"sanctions": sanctions, "sanctioned_persons": sanctioned_persons}
 
-        self.sanctions = deduplicate_rows(self.sanctions, ["sanction_id"])
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
+        raw_inabilitados: pd.DataFrame = data.get("raw_inabilitados", pd.DataFrame())
+        raw_inidoneos: pd.DataFrame = data.get("raw_inidoneos", pd.DataFrame())
+        raw_irregulares: pd.DataFrame = data.get("raw_irregulares", pd.DataFrame())
+        raw_irregulares_eleitorais: pd.DataFrame = data.get("raw_irregulares_eleitorais", pd.DataFrame())
+        dict_result: dict[str, list[dict[str, Any]]] = {}
+        inabilitados_result = self._process_inabilitados(raw_inabilitados)
+        inidoneos_result = self._process_inidoneos(raw_inidoneos)
+        irregulares_result = self._process_irregulares(raw_irregulares)
+        irregulares_eleitorais_result = self._process_irregulares_eleitorais(raw_irregulares_eleitorais)
+
+        dict_result = {
+            "sanctions": inabilitados_result["sanctions"] + inidoneos_result["sanctions"] + irregulares_result["sanctions"] + irregulares_eleitorais_result["sanctions"],
+            "sanctioned_persons": inabilitados_result["sanctioned_persons"] + inidoneos_result.get("sanctioned_persons", []) + irregulares_result.get("sanctioned_persons", []) + irregulares_eleitorais_result.get("sanctioned_persons", []),
+            "sanctioned_companies": inidoneos_result.get("sanctioned_companies", []) + irregulares_result.get("sanctioned_companies", []),
+        }
+
+        dict_result["sanctions"] = deduplicate_rows(dict_result["sanctions"], ["sanction_id"])
 
         logger.info(
             "[tcu] Transformed: %d sanctions, %d person links, %d company links",
-            len(self.sanctions),
-            len(self.sanctioned_persons),
-            len(self.sanctioned_companies),
+            len(dict_result["sanctions"]),
+            len(dict_result["sanctioned_persons"]),
+            len(dict_result["sanctioned_companies"]),
         )
 
-    def load(self) -> None:
+        return dict_result
+
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
         # Load Sanction nodes
-        if self.sanctions:
-            loader.load_nodes("Sanction", self.sanctions, key_field="sanction_id")
-            logger.info("[tcu] Loaded %d Sanction nodes", len(self.sanctions))
+        if data["sanctions"]:
+            loader.load_nodes("Sanction", data["sanctions"], key_field="sanction_id")
+            logger.info("[tcu] Loaded %d Sanction nodes", len(data["sanctions"]))
 
         # Merge Person nodes and create relationships
-        if self.sanctioned_persons:
+        if data["sanctioned_persons"]:
             person_nodes = deduplicate_rows(
-                [{"cpf": p["cpf"], "name": p["name"]} for p in self.sanctioned_persons],
+                [{"cpf": p["cpf"], "name": p["name"]} for p in data["sanctioned_persons"]],
                 ["cpf"],
             )
             loader.load_nodes("Person", person_nodes, key_field="cpf")
@@ -290,7 +314,7 @@ class TcuPipeline(Pipeline):
 
             person_rels = [
                 {"source_key": p["cpf"], "target_key": p["sanction_id"]}
-                for p in self.sanctioned_persons
+                for p in data["sanctioned_persons"]
             ]
             query_person = (
                 "UNWIND $rows AS row "
@@ -298,15 +322,15 @@ class TcuPipeline(Pipeline):
                 "MATCH (s:Sanction {sanction_id: row.target_key}) "
                 "MERGE (p)-[:SANCIONADA]->(s)"
             )
-            loader.run_query_with_retry(query_person, person_rels)
+            loader.run_query(query_person, person_rels)
             logger.info("[tcu] Created %d Person-SANCIONADA->Sanction rels", len(person_rels))
 
         # Merge Company nodes and create relationships
-        if self.sanctioned_companies:
+        if data["sanctioned_companies"]:
             company_nodes = deduplicate_rows(
                 [
                     {"cnpj": c["cnpj"], "razao_social": c["razao_social"], "name": c["name"]}
-                    for c in self.sanctioned_companies
+                    for c in data["sanctioned_companies"]
                 ],
                 ["cnpj"],
             )
@@ -315,7 +339,7 @@ class TcuPipeline(Pipeline):
 
             company_rels = [
                 {"source_key": c["cnpj"], "target_key": c["sanction_id"]}
-                for c in self.sanctioned_companies
+                for c in data["sanctioned_companies"]
             ]
             query_company = (
                 "UNWIND $rows AS row "
@@ -323,5 +347,5 @@ class TcuPipeline(Pipeline):
                 "MATCH (s:Sanction {sanction_id: row.target_key}) "
                 "MERGE (c)-[:SANCIONADA]->(s)"
             )
-            loader.run_query_with_retry(query_company, company_rels)
+            loader.run_query(query_company, company_rels)
             logger.info("[tcu] Created %d Company-SANCIONADA->Sanction rels", len(company_rels))

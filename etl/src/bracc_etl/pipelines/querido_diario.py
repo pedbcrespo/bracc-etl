@@ -63,16 +63,12 @@ class QueridoDiarioPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_acts: list[dict[str, str]] = []
-        self.acts: list[dict[str, Any]] = []
-        self.company_mentions: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self.run_id = f"{self.name}_{pd.Timestamp.utcnow().strftime('%Y%m%d%H%M%S')}"
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, str]]:
         src_dir = Path(self.data_dir) / "querido_diario"
         if not src_dir.exists():
             logger.warning("[querido_diario] data dir not found: %s", src_dir)
@@ -118,17 +114,17 @@ class QueridoDiarioPipeline(Pipeline):
         if self.limit:
             records = records[: self.limit]
 
-        self._raw_acts = records
-        logger.info("[querido_diario] extracted %d records", len(self._raw_acts))
+        logger.info("[querido_diario] extracted %d records", len(records))
+        return records
 
-    def transform(self) -> None:
-        if not self._raw_acts:
+    def transform(self, raw_acts: list[dict[str, str]]) -> dict[str, list[dict[str, Any]]]:
+        if not raw_acts:
             return
 
         acts: list[dict[str, Any]] = []
         mentions: list[dict[str, Any]] = []
 
-        for row in self._raw_acts:
+        for row in raw_acts:
             city = str(row.get("municipality_name") or row.get("municipio") or "").strip()
             city_code = str(row.get("municipality_code") or row.get("cod_ibge") or "").strip()
             uf = str(row.get("uf") or row.get("estado") or "").strip()
@@ -185,31 +181,30 @@ class QueridoDiarioPipeline(Pipeline):
                         "extract_span": span,
                         "run_id": self.run_id,
                     })
+    
+        return {
+            "acts": deduplicate_rows(acts, ["municipal_gazette_act_id"]),
+            "company_mentions": deduplicate_rows(mentions,["cnpj", "target_key", "method", "extract_span"],),
+        }
 
-        self.acts = deduplicate_rows(acts, ["municipal_gazette_act_id"])
-        self.company_mentions = deduplicate_rows(
-            mentions,
-            ["cnpj", "target_key", "method", "extract_span"],
-        )
-
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.acts:
+        if data.get("acts"):
             loader.load_nodes(
                 "MunicipalGazetteAct",
-                self.acts,
+                data["acts"],
                 key_field="municipal_gazette_act_id",
             )
 
-        if self.company_mentions:
+        if data.get("company_mentions"):
             companies = deduplicate_rows(
                 [
                     {
                         "cnpj": row["cnpj"],
                         "razao_social": row["cnpj"],
                     }
-                    for row in self.company_mentions
+                    for row in data["company_mentions"]
                 ],
                 ["cnpj"],
             )
@@ -226,4 +221,4 @@ class QueridoDiarioPipeline(Pipeline):
                 "m.extract_span = row.extract_span, "
                 "m.run_id = row.run_id"
             )
-            loader.run_query_with_retry(query, self.company_mentions)
+            loader.run_query_with_retry(query, data["company_mentions"])

@@ -143,16 +143,11 @@ class DouPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_acts: list[dict[str, str]] = []
-        self.acts: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, str]]:
         dou_dir = Path(self.data_dir) / "dou"
         if not dou_dir.exists():
             msg = f"DOU data directory not found at {dou_dir}"
@@ -162,20 +157,21 @@ class DouPipeline(Pipeline):
         parquet_files = sorted(dou_dir.rglob("*.parquet"))
         xml_files = sorted(dou_dir.rglob("*.xml"))
         json_files = sorted(dou_dir.glob("*.json"))
+        raw_acts: list[dict[str, str]] = []
 
         if parquet_files:
-            self._extract_parquet(parquet_files)
+            raw_acts = self._extract_parquet(parquet_files)
         elif xml_files:
-            self._extract_xml(xml_files)
+            raw_acts = self._extract_xml(xml_files)
         elif json_files:
-            self._extract_json(json_files)
+            raw_acts = self._extract_json(json_files)
         else:
             logger.warning("[dou] No parquet, XML, or JSON files found in %s", dou_dir)
-            return
+            return []
+        logger.info("[dou] Extracted %d act records", len(raw_acts))
+        return raw_acts
 
-        logger.info("[dou] Extracted %d act records", len(self._raw_acts))
-
-    def _extract_parquet(self, parquet_files: list[Path]) -> None:
+    def _extract_parquet(self, parquet_files: list[Path]) -> list[dict[str, str]]:
         """Extract acts from BigQuery parquet exports (basedosdados DOU)."""
         import pyarrow as pa  # type: ignore[import-not-found]
         import pyarrow.compute as pc  # type: ignore[import-not-found]
@@ -197,7 +193,7 @@ class DouPipeline(Pipeline):
                 continue
 
             logger.info("[dou] Reading %d rows from %s", len(df), f.name)
-
+            raw_acts: list[dict[str, str]] = []
             for _, row in df.iterrows():
                 titulo = str(row.get("titulo", "") or "").strip()
                 orgao = str(row.get("orgao", "") or "").strip()
@@ -214,7 +210,7 @@ class DouPipeline(Pipeline):
                 # Combine ementa + excerto for abstract text
                 abstract = f"{ementa} {excerto}".strip()
 
-                self._raw_acts.append({
+                raw_acts.append({
                     "urlTitle": url_title,
                     "title": titulo,
                     "abstract": abstract[:2000],
@@ -224,10 +220,11 @@ class DouPipeline(Pipeline):
                     "hierarchyStr": orgao,
                 })
 
-                if self.limit and len(self._raw_acts) >= self.limit:
-                    return
+                if self.limit and len(raw_acts) >= self.limit:
+                    return raw_acts
+            return raw_acts
 
-    def _extract_xml(self, xml_files: list[Path]) -> None:
+    def _extract_xml(self, xml_files: list[Path]) -> list[dict[str, str]]:
         """Extract acts from Imprensa Nacional XML dumps."""
         for f in xml_files:
             try:
@@ -242,6 +239,8 @@ class DouPipeline(Pipeline):
             articles = root.findall(".//article")
             if not articles:
                 articles = [root] if root.tag == "article" else []
+
+            raw_acts: list[dict[str, str]] = []
 
             for article in articles:
                 identifica = article.find(".//identifica")
@@ -270,7 +269,7 @@ class DouPipeline(Pipeline):
                 # Use article id or generate from title+date
                 art_id = article.get("id", "") or article.get("artType", "")
 
-                self._raw_acts.append({
+                raw_acts.append({
                     "urlTitle": art_id,
                     "title": title,
                     "abstract": abstract[:2000],
@@ -280,11 +279,13 @@ class DouPipeline(Pipeline):
                     "hierarchyStr": agency,
                 })
 
-                if self.limit and len(self._raw_acts) >= self.limit:
-                    return
+                if self.limit and len(raw_acts) >= self.limit:
+                    return raw_acts
+        return raw_acts
 
-    def _extract_json(self, json_files: list[Path]) -> None:
+    def _extract_json(self, json_files: list[Path]) -> list[dict[str, str]]:
         """Extract acts from legacy JSON format (IN search API)."""
+        raw_acts: list[dict[str, str]] = []
         for f in json_files:
             with open(f, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -298,7 +299,7 @@ class DouPipeline(Pipeline):
                 continue
 
             for item in items:
-                self._raw_acts.append({
+                raw_acts.append({
                     "urlTitle": str(item.get("urlTitle", "")),
                     "title": str(item.get("title", "")),
                     "abstract": str(item.get("abstract", "")),
@@ -308,16 +309,18 @@ class DouPipeline(Pipeline):
                     "hierarchyStr": str(item.get("hierarchyStr", "")),
                 })
 
-                if self.limit and len(self._raw_acts) >= self.limit:
-                    return
+                if self.limit and len(raw_acts) >= self.limit:
+                    return raw_acts
+        return raw_acts
 
-    def transform(self) -> None:
+    def transform(self, data:list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         acts: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
         skipped = 0
+        dict_results: dict[str, list[dict[str, Any]]] = {}
 
-        for raw in self._raw_acts:
+        for raw in data:
             url_title = raw["urlTitle"].strip()
             title = raw["title"].strip()
             abstract = raw["abstract"].strip()
@@ -365,48 +368,49 @@ class DouPipeline(Pipeline):
                     "source_key": cnpj,
                     "target_key": act_id,
                 })
-
-        self.acts = deduplicate_rows(acts, ["act_id"])
-        self.person_rels = person_rels
-        self.company_rels = company_rels
+        
+        dict_results["acts"] = deduplicate_rows(acts, ["act_id"])
+        dict_results["person_rels"] = person_rels
+        dict_results["company_rels"] = company_rels
 
         logger.info(
             "[dou] Transformed %d acts (%d person links, %d company links, skipped %d)",
-            len(self.acts),
-            len(self.person_rels),
-            len(self.company_rels),
+            len(dict_results["acts"]),
+            len(dict_results["person_rels"]),
+            len(dict_results["company_rels"]),
             skipped,
         )
+        return dict_results
 
-    def load(self) -> None:
-        if not self.acts:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        if not data["acts"]:
             logger.warning("[dou] No acts to load")
             return
 
         loader = Neo4jBatchLoader(self.driver)
 
         # Load DOUAct nodes
-        count = loader.load_nodes("DOUAct", self.acts, key_field="act_id")
+        count = loader.load_nodes("DOUAct", data["acts"], key_field="act_id")
         logger.info("[dou] Loaded %d DOUAct nodes", count)
 
         # PUBLICOU: Person -> DOUAct (match existing persons by CPF)
-        if self.person_rels:
+        if data["person_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
                 "MATCH (a:DOUAct {act_id: row.target_key}) "
                 "MERGE (p)-[:PUBLICOU]->(a)"
             )
-            count = loader.run_query_with_retry(query, self.person_rels)
+            count = loader.run_query_with_retry(query, data["person_rels"])
             logger.info("[dou] Created %d PUBLICOU relationships", count)
 
         # MENCIONOU: Company -> DOUAct (match existing companies by CNPJ)
-        if self.company_rels:
+        if data["company_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (c:Company {cnpj: row.source_key}) "
                 "MATCH (a:DOUAct {act_id: row.target_key}) "
                 "MERGE (c)-[:MENCIONOU]->(a)"
             )
-            count = loader.run_query_with_retry(query, self.company_rels)
+            count = loader.run_query_with_retry(query, data["company_rels"])
             logger.info("[dou] Created %d MENCIONOU relationships", count)

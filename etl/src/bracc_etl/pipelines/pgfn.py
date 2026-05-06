@@ -37,13 +37,9 @@ class PgfnPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._csv_files: list[Path] = []
-        self.finances: list[dict[str, Any]] = []
-        self.relationships: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
     def _parse_value(self, value: str) -> float:
         """Parse numeric value (may use comma as decimal sep)."""
@@ -55,26 +51,29 @@ class PgfnPipeline(Pipeline):
         except ValueError:
             return 0.0
 
-    def extract(self) -> None:
+    def extract(self) -> list[Path]:
         pgfn_dir = Path(self.data_dir) / "pgfn"
+        csv_files: list[Path] = []
         if not pgfn_dir.exists():
             logger.warning("[%s] Data directory not found: %s", self.name, pgfn_dir)
-            return
-        self._csv_files = sorted(pgfn_dir.glob("arquivo_lai_SIDA_*_*.csv"))
-        if not self._csv_files:
+            return []
+        csv_files = sorted(pgfn_dir.glob("arquivo_lai_SIDA_*_*.csv"))
+        if not csv_files:
             logger.warning("[%s] No PGFN CSV files found in %s", self.name, pgfn_dir)
-            return
-        logger.info("[pgfn] Found %d CSV files to process", len(self._csv_files))
+            return []
+        logger.info("[pgfn] Found %d CSV files to process", len(csv_files))
+        return csv_files
 
-    def transform(self) -> None:
+    def transform(self, csv_files: list[Path]) -> dict[str, list[dict[str, Any]]]:
         finances: list[dict[str, Any]] = []
         relationships: list[dict[str, Any]] = []
+        dict_result: dict[str, list[dict[str, Any]]] = {}
         skipped_pf = 0
         skipped_corresponsavel = 0
         skipped_bad_cnpj = 0
         seen_inscricoes: set[str] = set()
 
-        for csv_file in self._csv_files:
+        for csv_file in csv_files:
             logger.info("[pgfn] Processing %s", csv_file.name)
 
             for chunk in pd.read_csv(
@@ -83,7 +82,7 @@ class PgfnPipeline(Pipeline):
                 delimiter=";",
                 encoding="latin-1",
                 keep_default_na=False,
-                chunksize=100_000,
+                chunksize=self.chunk_size,
             ):
                 # Filter to company principal debtors using vectorized ops
                 mask_pj = chunk["TIPO_PESSOA"].str.contains("jur", case=False, na=False)
@@ -141,13 +140,15 @@ class PgfnPipeline(Pipeline):
             if self.limit and len(finances) >= self.limit:
                 break
 
-        self.finances = finances
-        self.relationships = relationships
+        dict_result = {
+            "finances": finances,
+            "relationships": relationships,
+        }
 
         logger.info(
             "[pgfn] Transformed %d Finance nodes, %d relationships",
-            len(self.finances),
-            len(self.relationships),
+            len(dict_result["finances"]),
+            len(dict_result["relationships"]),
         )
         logger.info(
             "[pgfn] Skipped: %d person (masked CPF), %d co-responsible, %d bad CNPJ",
@@ -155,15 +156,18 @@ class PgfnPipeline(Pipeline):
             skipped_corresponsavel,
             skipped_bad_cnpj,
         )
+        return dict_result
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
+        finances = data.get("finances", [])
+        relationships = data.get("relationships", [])
 
-        if self.finances:
-            loaded = loader.load_nodes("Finance", self.finances, key_field="finance_id")
+        if finances:
+            loaded = loader.load_nodes("Finance", finances, key_field="finance_id")
             logger.info("[pgfn] Loaded %d Finance nodes", loaded)
 
-        if self.relationships:
+        if relationships:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (c:Company {cnpj: row.source_key}) "
@@ -174,5 +178,5 @@ class PgfnPipeline(Pipeline):
                 "SET r.value = row.value, "
                 "    r.date = row.date"
             )
-            loaded = loader.run_query_with_retry(query, self.relationships, batch_size=2000)
+            loaded = loader.run_query_with_retry(query, relationships, batch_size=2000)
             logger.info("[pgfn] Loaded %d DEVE relationships", loaded)

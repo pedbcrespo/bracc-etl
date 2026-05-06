@@ -35,16 +35,13 @@ class HoldingsPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.holding_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         holdings_dir = Path(self.data_dir) / "holdings"
-
+        raw: pd.DataFrame = pd.DataFrame()
         # Try gzipped CSV first, then plain CSV
         gz_path = holdings_dir / "holding.csv.gz"
         csv_path = holdings_dir / "holding.csv"
@@ -56,25 +53,27 @@ class HoldingsPipeline(Pipeline):
 
         if gz_path.exists():
             logger.info("[holdings] Reading %s", gz_path)
-            self._raw = pd.read_csv(gz_path, compression="gzip", **read_opts)
+            raw = pd.read_csv(gz_path, compression="gzip", **read_opts, chunksize=self.chunk_size)
         elif csv_path.exists():
             logger.info("[holdings] Reading %s", csv_path)
-            self._raw = pd.read_csv(csv_path, **read_opts)
+            raw = pd.read_csv(csv_path, **read_opts, chunksize=self.chunk_size)
         else:
             logger.warning(
                 "[holdings] No holding.csv or holding.csv.gz found at %s", holdings_dir
             )
-            return
+            return pd.DataFrame()
 
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw = raw.head(self.limit)
 
-        logger.info("[holdings] Extracted %d rows", len(self._raw))
+        logger.info("[holdings] Extracted %d rows", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> list[dict[str, Any]]:
         rels: list[dict[str, Any]] = []
+        holding_rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             # Support both column naming conventions
             cnpj_empresa_raw = str(
                 row.get("cnpj_empresa") or row.get("cnpj") or ""
@@ -102,22 +101,23 @@ class HoldingsPipeline(Pipeline):
                 "target_key": cnpj_empresa,
             })
 
-        self.holding_rels = rels
+        holding_rels = rels
 
         logger.info(
             "[holdings] Transformed %d HOLDING_DE relationships",
-            len(self.holding_rels),
+            len(holding_rels),
         )
+        return holding_rels
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+    def load(self, data: list[dict[str, Any]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
 
-        if self.holding_rels:
+        if data:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (holder:Company {cnpj: row.source_key}) "
                 "MATCH (held:Company {cnpj: row.target_key}) "
                 "MERGE (holder)-[:HOLDING_DE]->(held)"
             )
-            loaded = loader.run_query_with_retry(query, self.holding_rels)
+            loaded = loader.run_query_with_retry(query, data)
             logger.info("[holdings] Loaded %d HOLDING_DE relationships", loaded)

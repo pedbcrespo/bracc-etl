@@ -37,17 +37,14 @@ class CvmPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw_processos: pd.DataFrame = pd.DataFrame()
-        self._raw_acusados: pd.DataFrame = pd.DataFrame()
-        self.proceedings: list[dict[str, Any]] = []
-        self.accused_entities: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         cvm_dir = Path(self.data_dir) / "cvm"
+        raw_processos: pd.DataFrame = pd.DataFrame()
+        raw_acusados: pd.DataFrame = pd.DataFrame()
 
         # New CVM format (processo_sancionador.zip contents)
         proc_path = cvm_dir / "processo_sancionador.csv"
@@ -57,27 +54,35 @@ class CvmPipeline(Pipeline):
             msg = f"CVM proceedings file not found: {proc_path}"
             raise FileNotFoundError(msg)
 
-        self._raw_processos = pd.read_csv(
+        raw_processos = pd.read_csv(
             proc_path,
             sep=";",
             dtype=str,
             keep_default_na=False,
             encoding="latin-1",
+            chunksize=self.chunk_size,
         )
         if acusado_path.exists():
-            self._raw_acusados = pd.read_csv(
+            raw_acusados = pd.read_csv(
                 acusado_path,
                 sep=";",
                 dtype=str,
                 keep_default_na=False,
                 encoding="latin-1",
+                chunksize=self.chunk_size,
             )
+        return {
+            "raw_processos": raw_processos,
+            "raw_acusados": raw_acusados
+        }
 
-    def transform(self) -> None:
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
         # Build accused lookup by NUP
         accused_by_nup: dict[str, list[dict[str, str]]] = {}
-        if not self._raw_acusados.empty:
-            for _, row in self._raw_acusados.iterrows():
+        dict_results: dict[str, list[dict[str, Any]]] = {}
+
+        if not data["raw_acusados"].empty:
+            for _, row in data["raw_acusados"].iterrows():
                 nup = str(row.get("NUP", "")).strip()
                 if not nup:
                     continue
@@ -93,7 +98,7 @@ class CvmPipeline(Pipeline):
         proceedings: list[dict[str, Any]] = []
         entities: list[dict[str, Any]] = []
 
-        for _, row in self._raw_processos.iterrows():
+        for _, row in data["raw_processos"].iterrows():
             nup = str(row.get("NUP", "")).strip()
             if not nup:
                 continue
@@ -125,33 +130,35 @@ class CvmPipeline(Pipeline):
                     "accused_date": accused["date"],
                 })
 
-        self.proceedings = deduplicate_rows(proceedings, ["pas_id"])
-        self.accused_entities = entities
+        dict_results["proceedings"] = deduplicate_rows(proceedings, ["pas_id"])
+        dict_results["accused_entities"] = entities
 
         if self.limit:
-            self.proceedings = self.proceedings[: self.limit]
-            self.accused_entities = self.accused_entities[: self.limit]
+            dict_results["proceedings"] = dict_results["proceedings"][: self.limit]
+            dict_results["accused_entities"] = dict_results["accused_entities"][: self.limit]
 
         logger.info(
             "Transformed: %d proceedings, %d accused entities",
-            len(self.proceedings),
-            len(self.accused_entities),
+            len(dict_results["proceedings"]),
+            len(dict_results["accused_entities"]),
         )
+        return dict_results
 
-    def load(self) -> None:
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
-
-        if self.proceedings:
-            loader.load_nodes("CVMProceeding", self.proceedings, key_field="pas_id")
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
+        loader = Neo4jBatchLoader(self.driver)
+        proceedings = data.get("proceedings", [])
+        accused_entities = data.get("accused_entities", [])
+        if proceedings:
+            loader.load_nodes("CVMProceeding", proceedings, key_field="pas_id")
 
         # Name-based matching: find existing Person/Company by name
-        if self.accused_entities:
+        if accused_entities:
             rel_rows = [
                 {
                     "target_key": e["target_key"],
                     "entity_name": e["entity_name"],
                 }
-                for e in self.accused_entities
+                for e in accused_entities
                 if e["entity_name"]
             ]
 
@@ -164,4 +171,4 @@ class CvmPipeline(Pipeline):
                 "WHERE entity IS NOT NULL "
                 "MERGE (entity)-[:CVM_SANCIONADA]->(p)"
             )
-            loader.run_query_with_retry(query, rel_rows)
+            loader.run_query(query, rel_rows)

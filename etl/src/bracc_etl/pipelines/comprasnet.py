@@ -70,18 +70,17 @@ class ComprasnetPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self.contracts: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> list[dict[str, Any]]:
         src_dir = Path(self.data_dir) / "comprasnet"
         json_files = sorted(src_dir.glob("*_contratos.json"))
         if not json_files:
             logger.warning("No PNCP JSON files found in %s", src_dir)
-            return
+            return []
 
         all_records: list[dict[str, Any]] = []
         for f in json_files:
@@ -90,9 +89,9 @@ class ComprasnetPipeline(Pipeline):
             logger.info("  Loaded %d records from %s", len(records), f.name)
 
         logger.info("Total raw records: %d", len(all_records))
-        self._raw_records = all_records
+        return all_records
 
-    def transform(self) -> None:
+    def transform(self, data:list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not hasattr(self, "_raw_records"):
             return
 
@@ -100,7 +99,7 @@ class ComprasnetPipeline(Pipeline):
         skipped_no_cnpj = 0
         skipped_no_value = 0
 
-        for rec in self._raw_records:
+        for rec in data:
             # Extract supplier CNPJ
             ni_fornecedor = str(rec.get("niFornecedor", "")).strip()
             cnpj_digits = strip_document(ni_fornecedor)
@@ -173,7 +172,7 @@ class ComprasnetPipeline(Pipeline):
                 "source": "comprasnet",
             })
 
-        self.contracts = deduplicate_rows(contracts, ["contract_id"])
+        contracts = deduplicate_rows(contracts, ["contract_id"])
 
         logger.info(
             "Transformed: %d contracts (skipped %d no-CNPJ, %d zero-value)",
@@ -183,10 +182,11 @@ class ComprasnetPipeline(Pipeline):
         )
 
         if self.limit:
-            self.contracts = self.contracts[: self.limit]
+            contracts = contracts[: self.limit]
+        return contracts
 
-    def load(self) -> None:
-        if not self.contracts:
+    def load(self, data: list[dict[str, Any]]) -> None:
+        if not data:
             logger.warning("No contracts to load")
             return
 
@@ -204,7 +204,7 @@ class ComprasnetPipeline(Pipeline):
                 "tipo_contrato": c["tipo_contrato"],
                 "source": c["source"],
             }
-            for c in self.contracts
+            for c in data
         ]
         count = loader.load_nodes(
             "Contract", contract_nodes, key_field="contract_id",
@@ -215,7 +215,7 @@ class ComprasnetPipeline(Pipeline):
         companies = deduplicate_rows(
             [
                 {"cnpj": c["cnpj"], "razao_social": c["razao_social"]}
-                for c in self.contracts
+                for c in data
             ],
             ["cnpj"],
         )
@@ -225,7 +225,7 @@ class ComprasnetPipeline(Pipeline):
         # VENCEU: Company -> Contract
         rels = [
             {"source_key": c["cnpj"], "target_key": c["contract_id"]}
-            for c in self.contracts
+            for c in data
         ]
         count = loader.load_relationships(
             rel_type="VENCEU",
@@ -240,7 +240,7 @@ class ComprasnetPipeline(Pipeline):
         # REFERENTE_A: Contract -> Bid (deterministic PNCP linkage)
         contract_bid_rels = [
             {"source_key": c["contract_id"], "target_key": c["bid_id"]}
-            for c in self.contracts
+            for c in data
             if c.get("bid_id")
         ]
         count = loader.load_relationships(

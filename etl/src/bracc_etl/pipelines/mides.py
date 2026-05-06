@@ -73,22 +73,9 @@ class MidesPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-
-        self._raw_bids: pd.DataFrame = pd.DataFrame()
-        self._raw_contracts: pd.DataFrame = pd.DataFrame()
-        self._raw_items: pd.DataFrame = pd.DataFrame()
-
-        self.bids: list[dict[str, Any]] = []
-        self.contracts: list[dict[str, Any]] = []
-        self.items: list[dict[str, Any]] = []
-        self.bid_company_rels: list[dict[str, Any]] = []
-        self.contract_company_rels: list[dict[str, Any]] = []
-        self.contract_bid_rels: list[dict[str, Any]] = []
-        self.contract_item_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
     def _read_df_optional(self, path: Path) -> pd.DataFrame:
         if not path.exists():
@@ -97,49 +84,65 @@ class MidesPipeline(Pipeline):
             return pd.read_parquet(path)
         return pd.read_csv(path, dtype=str, keep_default_na=False)
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         src_dir = Path(self.data_dir) / "mides"
-        self._raw_bids = self._read_df_optional(src_dir / "licitacao.csv")
-        if self._raw_bids.empty:
-            self._raw_bids = self._read_df_optional(src_dir / "licitacao.parquet")
+        raw_bids: pd.DataFrame = pd.DataFrame()
+        raw_contracts: pd.DataFrame = pd.DataFrame()
+        raw_items: pd.DataFrame = pd.DataFrame()
 
-        self._raw_contracts = self._read_df_optional(src_dir / "contrato.csv")
-        if self._raw_contracts.empty:
-            self._raw_contracts = self._read_df_optional(src_dir / "contrato.parquet")
+        raw_bids = self._read_df_optional(src_dir / "licitacao.csv")
+        if raw_bids.empty:
+            raw_bids = self._read_df_optional(src_dir / "licitacao.parquet")
 
-        self._raw_items = self._read_df_optional(src_dir / "item.csv")
-        if self._raw_items.empty:
-            self._raw_items = self._read_df_optional(src_dir / "item.parquet")
+        raw_contracts = self._read_df_optional(src_dir / "contrato.csv")
+        if raw_contracts.empty:
+            raw_contracts = self._read_df_optional(src_dir / "contrato.parquet")
 
-        if self._raw_bids.empty and self._raw_contracts.empty and self._raw_items.empty:
+        raw_items = self._read_df_optional(src_dir / "item.csv")
+        if raw_items.empty:
+            raw_items = self._read_df_optional(src_dir / "item.parquet")
+
+        if raw_bids.empty and raw_contracts.empty and raw_items.empty:
             logger.warning("[mides] no input files found in %s", src_dir)
-            return
+            return {}
 
         if self.limit:
-            self._raw_bids = self._raw_bids.head(self.limit)
-            self._raw_contracts = self._raw_contracts.head(self.limit)
-            self._raw_items = self._raw_items.head(self.limit)
+            raw_bids = raw_bids.head(self.limit)
+            raw_contracts = raw_contracts.head(self.limit)
+            raw_items = raw_items.head(self.limit)
 
         logger.info(
             "[mides] extracted bids=%d contracts=%d items=%d",
-            len(self._raw_bids),
-            len(self._raw_contracts),
-            len(self._raw_items),
+            len(raw_bids),
+            len(raw_contracts),
+            len(raw_items),
         )
+        return {
+            "raw_bids": raw_bids,
+            "raw_contracts": raw_contracts,
+            "raw_items": raw_items,
+        }
 
-    def transform(self) -> None:
-        self._transform_bids()
-        self._transform_contracts()
-        self._transform_items()
+    def transform(self, data: dict[str, pd.DataFrame]) -> dict[str, list[dict[str, Any]]]:
 
-    def _transform_bids(self) -> None:
-        if self._raw_bids.empty:
-            return
+        dict_result: dict[str, list[dict[str, Any]]] = {
+                "bids": [],
+                "bid_company_rels": [],
+        }
+
+        dict_result["bids"], dict_result["bid_company_rels"] = self._transform_bids(data["raw_bids"])
+        dict_result["contracts"], dict_result["contract_company_rels"], dict_result["contract_bid_rels"] = self._transform_contracts(data["raw_contracts"])
+        dict_result["items"], dict_result["contract_item_rels"] = self._transform_items(data["raw_items"])
+        return dict_result
+
+    def _transform_bids(self, raw_bids: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if raw_bids.empty:
+            return [], []
 
         bids: list[dict[str, Any]] = []
         bid_company_rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw_bids.iterrows():
+        for _, row in raw_bids.iterrows():
             bid_id = _pick(row, "municipal_bid_id", "licitacao_id", "id_licitacao", "id")
             process_number = _pick(row, "process_number", "numero_processo", "numero")
             org_code = _pick(row, "municipality_code", "cod_ibge", "codigo_ibge")
@@ -185,18 +188,19 @@ class MidesPipeline(Pipeline):
                     "target_key": bid_id,
                 })
 
-        self.bids = deduplicate_rows(bids, ["municipal_bid_id"])
-        self.bid_company_rels = deduplicate_rows(bid_company_rels, ["cnpj", "target_key"])
+        bids = deduplicate_rows(bids, ["municipal_bid_id"])
+        bid_company_rels = deduplicate_rows(bid_company_rels, ["cnpj", "target_key"])
+        return bids, bid_company_rels
 
-    def _transform_contracts(self) -> None:
-        if self._raw_contracts.empty:
-            return
+    def _transform_contracts(self, raw_contracts: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        if raw_contracts.empty:
+            return [], [], []
 
         contracts: list[dict[str, Any]] = []
         contract_company_rels: list[dict[str, Any]] = []
         contract_bid_rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw_contracts.iterrows():
+        for _, row in raw_contracts.iterrows():
             contract_id = _pick(row, "municipal_contract_id", "contrato_id", "id_contrato", "id")
             number = _pick(row, "contract_number", "numero_contrato", "numero")
             bid_ref = _pick(row, "municipal_bid_id", "licitacao_id", "id_licitacao")
@@ -241,18 +245,19 @@ class MidesPipeline(Pipeline):
                     "target_key": bid_ref,
                 })
 
-        self.contracts = deduplicate_rows(contracts, ["municipal_contract_id"])
-        self.contract_company_rels = deduplicate_rows(contract_company_rels, ["cnpj", "target_key"])
-        self.contract_bid_rels = deduplicate_rows(contract_bid_rels, ["source_key", "target_key"])
+        contracts = deduplicate_rows(contracts, ["municipal_contract_id"])
+        contract_company_rels = deduplicate_rows(contract_company_rels, ["cnpj", "target_key"])
+        contract_bid_rels = deduplicate_rows(contract_bid_rels, ["source_key", "target_key"])
+        return contracts, contract_company_rels, contract_bid_rels
 
-    def _transform_items(self) -> None:
-        if self._raw_items.empty:
-            return
+    def _transform_items(self, raw_items: pd.DataFrame) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if raw_items.empty:
+            return [], []
 
         items: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw_items.iterrows():
+        for _, row in raw_items.iterrows():
             contract_id = _pick(row, "municipal_contract_id", "contrato_id", "id_contrato")
             bid_id = _pick(row, "municipal_bid_id", "licitacao_id", "id_licitacao")
 
@@ -281,33 +286,35 @@ class MidesPipeline(Pipeline):
             if contract_id:
                 rels.append({"source_key": contract_id, "target_key": item_id})
 
-        self.items = deduplicate_rows(items, ["municipal_item_id"])
-        self.contract_item_rels = deduplicate_rows(rels, ["source_key", "target_key"])
+        items = deduplicate_rows(items, ["municipal_item_id"])
+        contract_item_rels = deduplicate_rows(rels, ["source_key", "target_key"])
 
-    def load(self) -> None:
+        return items, contract_item_rels
+
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.bids:
-            loader.load_nodes("MunicipalBid", self.bids, key_field="municipal_bid_id")
+        if data.get("bids"):
+            loader.load_nodes("MunicipalBid", data["bids"], key_field="municipal_bid_id")
 
-        if self.contracts:
+        if data.get("contracts"):
             loader.load_nodes(
                 "MunicipalContract",
-                self.contracts,
+                data["contracts"],
                 key_field="municipal_contract_id",
             )
 
-        if self.items:
-            loader.load_nodes("MunicipalBidItem", self.items, key_field="municipal_item_id")
+        if data.get("items"):
+            loader.load_nodes("MunicipalBidItem", data["items"], key_field="municipal_item_id")
 
-        if self.bid_company_rels:
+        if data.get("bid_company_rels"):
             companies = deduplicate_rows(
                 [
                     {
                         "cnpj": row["cnpj"],
                         "razao_social": row["cnpj"],
                     }
-                    for row in self.bid_company_rels
+                    for row in data["bid_company_rels"]
                 ],
                 ["cnpj"],
             )
@@ -319,16 +326,16 @@ class MidesPipeline(Pipeline):
                 "MATCH (b:MunicipalBid {municipal_bid_id: row.target_key}) "
                 "MERGE (c)-[:MUNICIPAL_LICITOU]->(b)"
             )
-            loader.run_query_with_retry(query, self.bid_company_rels)
+            loader.run_query_with_retry(query, data["bid_company_rels"])
 
-        if self.contract_company_rels:
+        if data.get("contract_company_rels"):
             companies = deduplicate_rows(
                 [
                     {
                         "cnpj": row["cnpj"],
                         "razao_social": row["cnpj"],
                     }
-                    for row in self.contract_company_rels
+                    for row in data["contract_company_rels"]
                 ],
                 ["cnpj"],
             )
@@ -340,22 +347,22 @@ class MidesPipeline(Pipeline):
                 "MATCH (mc:MunicipalContract {municipal_contract_id: row.target_key}) "
                 "MERGE (c)-[:MUNICIPAL_VENCEU]->(mc)"
             )
-            loader.run_query_with_retry(query, self.contract_company_rels)
+            loader.run_query_with_retry(query, data["contract_company_rels"])
 
-        if self.contract_bid_rels:
+        if data.get("contract_bid_rels"):
             loader.load_relationships(
                 rel_type="REFERENTE_A",
-                rows=self.contract_bid_rels,
+                rows=data["contract_bid_rels"],
                 source_label="MunicipalContract",
                 source_key="municipal_contract_id",
                 target_label="MunicipalBid",
                 target_key="municipal_bid_id",
             )
 
-        if self.contract_item_rels:
+        if data.get("contract_item_rels"):
             loader.load_relationships(
                 rel_type="TEM_ITEM",
-                rows=self.contract_item_rels,
+                rows=data["contract_item_rels"],
                 source_label="MunicipalContract",
                 source_key="municipal_contract_id",
                 target_label="MunicipalBidItem",

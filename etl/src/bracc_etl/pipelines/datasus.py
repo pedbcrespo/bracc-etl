@@ -36,26 +36,27 @@ class DatasusPipeline(Pipeline):
         self.facilities: list[dict[str, Any]] = []
         self.company_links: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         datasus_dir = Path(self.data_dir) / "datasus"
         csv_path = datasus_dir / "cnes_all.csv"
         if not csv_path.exists():
             msg = f"CNES data not found at {csv_path}. Run scripts/download_datasus.py first."
             raise FileNotFoundError(msg)
 
-        self._raw = pd.read_csv(
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             keep_default_na=False,
         )
         if self.limit:
-            self._raw = self._raw.head(self.limit)
+            raw = raw.head(self.limit)
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         facilities: list[dict[str, Any]] = []
         company_links: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             cnes_code = str(row.get("codigo_cnes", "")).strip()
             if not cnes_code:
                 continue
@@ -105,29 +106,31 @@ class DatasusPipeline(Pipeline):
                     "razao_social": razao,
                 })
 
-        self.facilities = facilities
-        self.company_links = company_links
+        return {
+            "facilities": facilities,
+            "company_links": company_links
+        }
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
         # Create Health facility nodes
-        if self.facilities:
-            loader.load_nodes("Health", self.facilities, key_field="cnes_code")
+        if data["facilities"]:
+            loader.load_nodes("Health", data["facilities"], key_field="cnes_code")
 
         # Ensure Company nodes exist and create relationships
-        if self.company_links:
+        if data["company_links"]:
             # MERGE Company nodes (most should already exist from CNPJ pipeline)
             company_rows = [
                 {"cnpj": link["source_key"], "razao_social": link["razao_social"]}
-                for link in self.company_links
+                for link in data["company_links"]
             ]
             loader.load_nodes("Company", company_rows, key_field="cnpj")
 
             # Create OPERA_UNIDADE relationships
             loader.load_relationships(
                 rel_type="OPERA_UNIDADE",
-                rows=self.company_links,
+                rows=data["company_links"],
                 source_label="Company",
                 source_key="cnpj",
                 target_label="Health",

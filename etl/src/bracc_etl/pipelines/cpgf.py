@@ -83,16 +83,15 @@ class CpgfPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self._raw: pd.DataFrame = pd.DataFrame()
         self.expenses: list[dict[str, Any]] = []
         self.cardholders: list[dict[str, Any]] = []
         self.gastou_cartao_rels: list[dict[str, Any]] = []
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         cpgf_dir = Path(self.data_dir) / "cpgf"
         csv_files = sorted(cpgf_dir.glob("*.csv"))
         if not csv_files:
@@ -111,20 +110,21 @@ class CpgfPipeline(Pipeline):
             frames.append(df)
             logger.info("  Loaded %d rows from %s", len(df), f.name)
 
-        self._raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        self._raw = _normalize_columns(self._raw)
-        logger.info("Total raw rows: %d", len(self._raw))
+        raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        raw = _normalize_columns(raw)
+        logger.info("Total raw rows: %d", len(raw))
+        return raw
 
-    def transform(self) -> None:
-        if self._raw.empty:
-            return
+    def transform(self, data: pd.DataFrame) -> dict[str, Any]:
+        if data:
+            return {}
 
         expenses: list[dict[str, Any]] = []
         cardholders_map: dict[str, dict[str, Any]] = {}
         gastou_cartao: list[dict[str, Any]] = []
         skipped = 0
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             cpf_raw = str(row.get("CPF PORTADOR", "")).strip()
             digits = strip_document(cpf_raw)
 
@@ -179,42 +179,49 @@ class CpgfPipeline(Pipeline):
             if self.limit and len(expenses) >= self.limit:
                 break
 
-        self.expenses = deduplicate_rows(expenses, ["expense_id"])
-        self.cardholders = list(cardholders_map.values())
-        self.gastou_cartao_rels = gastou_cartao
+        dict_result = {
+            "expenses": deduplicate_rows(expenses, ["expense_id"]),
+            "cardholders": list(cardholders_map.values()),
+            "gastou_cartao_rels": gastou_cartao
+        }
 
         logger.info(
             "Transformed: %d expenses, %d cardholders (skipped %d)",
-            len(self.expenses),
-            len(self.cardholders),
+            len(dict_result["expenses"]),
+            len(dict_result["cardholders"]),
             skipped,
         )
+        return dict_result
 
-    def load(self) -> None:
-        if not self.expenses:
+    def load(self, data:dict[str, Any]) -> None:
+        expenses: list[dict[str, Any]] = data["expenses"]
+        cardholders: list[dict[str, Any]] = data["cardholders"]
+        gastou_cartao_rels: list[dict[str, Any]] = data["gastou_cartao_rels"]
+
+        if not expenses:
             logger.warning("No expenses to load")
             return
 
-        loader = Neo4jBatchLoader(self.driver, batch_size=1_000)
+        loader = Neo4jBatchLoader(self.driver)
 
         # Load GovCardExpense nodes
         count = loader.load_nodes(
-            "GovCardExpense", self.expenses, key_field="expense_id"
+            "GovCardExpense", expenses, key_field="expense_id"
         )
         logger.info("Loaded %d GovCardExpense nodes", count)
 
         # Merge Person nodes for cardholders
-        if self.cardholders:
-            count = loader.load_nodes("Person", self.cardholders, key_field="cpf")
+        if cardholders:
+            count = loader.load_nodes("Person", cardholders, key_field="cpf")
             logger.info("Merged %d cardholder Person nodes", count)
 
         # GASTOU_CARTAO: Person -> GovCardExpense
-        if self.gastou_cartao_rels:
+        if gastou_cartao_rels:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
                 "MATCH (e:GovCardExpense {expense_id: row.target_key}) "
                 "MERGE (p)-[:GASTOU_CARTAO]->(e)"
             )
-            count = loader.run_query_with_retry(query, self.gastou_cartao_rels)
+            count = loader.run_query_with_retry(query, gastou_cartao_rels)
             logger.info("Created %d GASTOU_CARTAO relationships", count)
