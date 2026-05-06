@@ -30,28 +30,25 @@ class CeafPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.expulsions: list[dict[str, Any]] = []
-        self.person_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         ceaf_dir = Path(self.data_dir) / "ceaf"
-        self._raw = pd.read_csv(
+        return pd.read_csv(
             ceaf_dir / "ceaf.csv",
             dtype=str,
             encoding="latin-1",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         expulsions: list[dict[str, Any]] = []
         person_rels: list[dict[str, Any]] = []
 
-        for idx, row in self._raw.iterrows():
+        for idx, row in data.iterrows():
             cpf_raw = str(row.get("cpf", ""))
             digits = strip_document(cpf_raw)
 
@@ -92,29 +89,30 @@ class CeafPipeline(Pipeline):
                     "target_key": expulsion_id,
                     "person_name": nome,
                 })
+        return {
+            "expulsions": deduplicate_rows(expulsions, ["expulsion_id"]),
+            "person_rels": person_rels, 
+        }
 
-        self.expulsions = deduplicate_rows(expulsions, ["expulsion_id"])
-        self.person_rels = person_rels
-
-    def load(self) -> None:
+    def load(self, transformed_data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.expulsions:
-            loader.load_nodes("Expulsion", self.expulsions, key_field="expulsion_id")
+        if transformed_data["expulsions"]:
+            loader.load_nodes("Expulsion", transformed_data["expulsions"], key_field="expulsion_id")
 
         # Ensure Person nodes exist
-        for rel in self.person_rels:
+        for rel in transformed_data["person_rels"]:
             loader.load_nodes(
                 "Person",
                 [{"cpf": rel["source_key"], "name": rel["person_name"]}],
                 key_field="cpf",
             )
 
-        if self.person_rels:
+        if transformed_data["person_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (p:Person {cpf: row.source_key}) "
                 "MATCH (e:Expulsion {expulsion_id: row.target_key}) "
                 "MERGE (p)-[:EXPULSO]->(e)"
             )
-            loader.run_query_with_retry(query, self.person_rels)
+            loader.run_query_with_retry(query, transformed_data["person_rels"])

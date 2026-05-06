@@ -50,29 +50,26 @@ class BcbPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.penalties: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         bcb_dir = Path(self.data_dir) / "bcb"
-        self._raw = pd.read_csv(
+        return pd.read_csv(
             bcb_dir / "penalidades.csv",
             sep=";",
             dtype=str,
             encoding="latin-1",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         penalties: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
 
-        for _idx, row in self._raw.iterrows():
+        for _idx, row in data.iterrows():
             cnpj_raw = str(row.get("CNPJ", ""))
             digits = strip_document(cnpj_raw)
 
@@ -108,28 +105,31 @@ class BcbPipeline(Pipeline):
                 "source_key": cnpj_formatted,
                 "target_key": penalty_id,
             })
+            
+        return {
+            "penalties": deduplicate_rows(penalties, ["penalty_id"]),
+            "company_rels": company_rels,   
+        }
 
-        self.penalties = deduplicate_rows(penalties, ["penalty_id"])
-        self.company_rels = company_rels
 
-    def load(self) -> None:
+    def load(self, data: list[dict[str, Any]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.penalties:
-            loader.load_nodes("BCBPenalty", self.penalties, key_field="penalty_id")
+        if data["penalties"]:
+            loader.load_nodes("BCBPenalty", data["penalties"], key_field="penalty_id")
 
         # Ensure Company nodes exist for CNPJ linking
-        if self.company_rels:
+        if data["company_rels"]:
             companies = [
-                {"cnpj": rel["source_key"]} for rel in self.company_rels
+                {"cnpj": rel["source_key"]} for rel in data["company_rels"]
             ]
             loader.load_nodes("Company", deduplicate_rows(companies, ["cnpj"]), key_field="cnpj")
 
-        if self.company_rels:
+        if data["company_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (c:Company {cnpj: row.source_key}) "
                 "MATCH (b:BCBPenalty {penalty_id: row.target_key}) "
                 "MERGE (c)-[:BCB_PENALIZADA]->(b)"
             )
-            loader.run_query_with_retry(query, self.company_rels)
+            loader.run_query_with_retry(query, data["company_rels"])

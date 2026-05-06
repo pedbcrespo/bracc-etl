@@ -214,12 +214,11 @@ class CNPJPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         history: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
-            driver, data_dir, limit=limit, chunk_size=chunk_size, history=history, **kwargs,
+            driver, data_dir, limit=limit, history=history, **kwargs,
         )
         self.run_id = f"cnpj-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
         self._raw_empresas: pd.DataFrame = pd.DataFrame()

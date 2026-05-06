@@ -87,20 +87,19 @@ class CagedPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._csv_files: list[Path] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> list[Path]:
         caged_dir = Path(self.data_dir) / "caged"
-        self._csv_files = sorted(caged_dir.glob("caged_*.csv"))
-        if not self._csv_files:
+        csv_files = sorted(caged_dir.glob("caged_*.csv"))
+        if not csv_files:
             logger.warning("No caged_*.csv files found in %s", caged_dir)
+        return csv_files
 
-    def transform(self) -> None:
-        pass  # Transform happens per chunk in load()
+    def transform(self, data: list[Path]) -> list[Path]:
+        return data
 
     def _transform_chunk(self, df: pd.DataFrame) -> list[dict[str, Any]]:
         """Transform a DataFrame chunk into aggregate LaborStats rows."""
@@ -197,16 +196,16 @@ class CagedPipeline(Pipeline):
 
         return deduplicate_rows(rows, ["stats_id"])
 
-    def load(self) -> None:
+    def load(self, data: list[Path]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        for csv_file in self._csv_files:
+        for csv_file in data:
             logger.info("Processing %s ...", csv_file.name)
             reader = pd.read_csv(
                 csv_file,
                 dtype=str,
                 keep_default_na=False,
-                chunksize=_READ_CHUNK_SIZE,
+                chunksize=self.chunk_size,
                 nrows=self.limit,
             )
             for chunk in reader:

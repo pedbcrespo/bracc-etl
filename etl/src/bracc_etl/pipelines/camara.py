@@ -59,10 +59,9 @@ class CamaraPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self._raw: pd.DataFrame = pd.DataFrame()
         self.expenses: list[dict[str, Any]] = []
         self.deputies: list[dict[str, Any]] = []
@@ -83,6 +82,23 @@ class CamaraPipeline(Pipeline):
     def load(self) -> None:
         """No-op — processamento feito em run() por arquivo."""
         pass
+
+    def cleanup(self) -> None:
+        """Clean up temporary attributes to free memory after pipeline run."""
+        attrs_to_delete = [
+            "_raw",
+            "expenses",
+            "deputies",
+            "deputies_by_id",
+            "suppliers",
+            "gastou_rels",
+            "gastou_by_deputy_id_rels",
+            "forneceu_rels",
+        ]
+        for attr in attrs_to_delete:
+            if hasattr(self, attr):
+                delattr(self, attr)
+                logger.info("[camara] Cleaned up attribute: %s", attr)
 
     def _transform_chunk(self, df: pd.DataFrame) -> tuple:
         """Transforma um DataFrame (1 CSV) usando vetorizacao 100% pandas."""
@@ -215,6 +231,7 @@ class CamaraPipeline(Pipeline):
                 dtype=str,
                 encoding="utf-8-sig",
                 keep_default_na=False,
+                chunksize=self.chunk_size,
             )
             logger.info("  Lidos %d linhas", len(df))
 
@@ -316,3 +333,4 @@ class CamaraPipeline(Pipeline):
             logger.info("  ✅ %s concluído — total acumulado: %d expenses", f.name, total_expenses)
 
         logger.info("[camara] ✅ CONCLUÍDO — %d expenses no total", total_expenses)
+        self.cleanup()

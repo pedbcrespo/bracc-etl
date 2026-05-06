@@ -32,10 +32,9 @@ class BndesPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
         self._raw: pd.DataFrame = pd.DataFrame()
         self.finances: list[dict[str, Any]] = []
         self.relationships: list[dict[str, Any]] = []
@@ -50,29 +49,32 @@ class BndesPipeline(Pipeline):
         except ValueError:
             return 0.0
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         bndes_dir = Path(self.data_dir) / "bndes"
+        raw: pd.DataFrame = pd.DataFrame()
         if not bndes_dir.exists():
             logger.warning("[%s] Data directory not found: %s", self.name, bndes_dir)
-            return
+            return raw  
         csv_path = bndes_dir / "operacoes-nao-automaticas.csv"
         if not csv_path.exists():
             logger.warning("[%s] CSV file not found: %s", self.name, csv_path)
-            return
-        self._raw = pd.read_csv(
+            return raw
+        raw = pd.read_csv(
             csv_path,
             dtype=str,
             delimiter=";",
             encoding="latin-1",
             keep_default_na=False,
+            chunksize=self.chunk_size,
         )
-        logger.info("[bndes] Extracted %d rows from non-automatic operations", len(self._raw))
+        logger.info("[bndes] Extracted %d rows from non-automatic operations", len(raw))
+        return raw
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         finances: list[dict[str, Any]] = []
         relationships: list[dict[str, Any]] = []
 
-        for _, row in self._raw.iterrows():
+        for _, row in data.iterrows():
             cnpj_raw = str(row.get("cnpj", "")).strip()
             digits = strip_document(cnpj_raw)
             if len(digits) != 14:
@@ -125,23 +127,25 @@ class BndesPipeline(Pipeline):
                 "date": date,
                 "client_name": cliente,
             })
-
-        self.finances = deduplicate_rows(finances, ["finance_id"])
-        self.relationships = relationships
+        dict_result = {
+            "finances": deduplicate_rows(finances, ["finance_id"]),
+            "relationships": relationships, 
+        }
         logger.info(
             "[bndes] Transformed %d Finance nodes, %d relationships",
-            len(self.finances),
-            len(self.relationships),
+            len(dict_result["finances"]),
+            len(dict_result["relationships"]),
         )
+        return dict_result
 
-    def load(self) -> None:
+    def load(self, data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.finances:
-            loaded = loader.load_nodes("Finance", self.finances, key_field="finance_id")
+        if data["finances"]:
+            loaded = loader.load_nodes("Finance", data["finances"], key_field="finance_id")
             logger.info("[bndes] Loaded %d Finance nodes", loaded)
 
-        if self.relationships:
+        if data["relationships"]:
             query = (
                 "UNWIND $rows AS row "
                 "MERGE (c:Company {cnpj: row.source_key}) "
@@ -154,5 +158,5 @@ class BndesPipeline(Pipeline):
                 "    r.rate = row.rate, "
                 "    r.date = row.date"
             )
-            loaded = loader.run_query_with_retry(query, self.relationships, batch_size=500)
+            loaded = loader.run_query_with_retry(query, data["relationships"], batch_size=500)
             logger.info("[bndes] Loaded %d RECEBEU_EMPRESTIMO relationships", loaded)

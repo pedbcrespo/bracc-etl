@@ -65,10 +65,9 @@ class CamaraInquiriesPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
         self._raw_inquiries: pd.DataFrame = pd.DataFrame()
         self._raw_requirements: pd.DataFrame = pd.DataFrame()
@@ -89,7 +88,10 @@ class CamaraInquiriesPipeline(Pipeline):
         if not path.exists():
             return pd.DataFrame()
         try:
-            return pd.read_csv(path, dtype=str, keep_default_na=False)
+            return pd.concat(
+                pd.read_csv(path, dtype=str, keep_default_na=False, chunksize=self.chunk_size),
+                ignore_index=True,
+            )
         except pd.errors.EmptyDataError:
             logger.info("[camara_inquiries] empty file (treated as no data): %s", path.name)
             return pd.DataFrame()
@@ -101,38 +103,51 @@ class CamaraInquiriesPipeline(Pipeline):
                 return value
         return ""
 
-    def extract(self) -> None:
+    def extract(self) -> dict[str, pd.DataFrame]:
         src_dir = Path(self.data_dir) / "camara_inquiries"
-        self._raw_inquiries = self._read_csv_optional(src_dir / "inquiries.csv")
-        self._raw_requirements = self._read_csv_optional(src_dir / "requirements.csv")
-        self._raw_sessions = self._read_csv_optional(src_dir / "sessions.csv")
+        dict_result: dict[str, pd.DataFrame] = {
+            "raw_inquiries": self._read_csv_optional(src_dir / "inquiries.csv"),
+            "raw_requirements": self._read_csv_optional(src_dir / "requirements.csv"),
+            "raw_sessions": self._read_csv_optional(src_dir / "sessions.csv"),
+        }
 
-        if self._raw_inquiries.empty:
+        if dict_result["raw_inquiries"].empty:
             logger.warning("[camara_inquiries] inquiries.csv not found/empty in %s", src_dir)
             return
 
         if self.limit:
-            self._raw_inquiries = self._raw_inquiries.head(self.limit)
+            dict_result["raw_inquiries"] = dict_result["raw_inquiries"].head(self.limit)
 
         logger.info(
             "[camara_inquiries] extracted inquiries=%d requirements=%d sessions=%d",
-            len(self._raw_inquiries),
-            len(self._raw_requirements),
-            len(self._raw_sessions),
+            len(dict_result["raw_inquiries"]),
+            len(dict_result["raw_requirements"]),
+            len(dict_result["raw_sessions"]),
         )
+        return dict_result
 
-    def transform(self) -> None:
-        if self._raw_inquiries.empty:
+    def transform(self, data: dict[str, pd.DataFrame]) -> None:
+        raw_inquiries = data["raw_inquiries"]
+        raw_requirements = data["raw_requirements"]
+        raw_sessions = data["raw_sessions"]
+
+        dict_result: dict[str, list[dict[str, Any]]] = {
+                "inquiries": [],
+                "requirements": [],
+                "sessions": [],
+        }   
+
+        if raw_inquiries.empty:
             return
 
-        self._transform_inquiries()
-        self._transform_requirements()
-        self._transform_sessions()
+        dict_result.update(self._transform_inquiries(raw_inquiries))
+        dict_result.update(self._transform_requirements(raw_requirements))
+        dict_result.update(self._transform_sessions(raw_sessions))
 
-    def _transform_inquiries(self) -> None:
+    def _transform_inquiries(self, raw_inquiries: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         rows: list[dict[str, Any]] = []
 
-        for _, row in self._raw_inquiries.iterrows():
+        for _, row in raw_inquiries.iterrows():
             inquiry_id = self._get(row, "inquiry_id", "id")
             code = self._get(row, "inquiry_code", "codigo")
             name = self._get(row, "name", "titulo", "nome")
@@ -169,11 +184,13 @@ class CamaraInquiriesPipeline(Pipeline):
                 "extraction_method": extraction_method,
             })
 
-        self.inquiries = deduplicate_rows(rows, ["inquiry_id"])
+        return {
+            "inquiries": deduplicate_rows(rows, ["inquiry_id"]),
+        }
 
-    def _transform_requirements(self) -> None:
-        if self._raw_requirements.empty:
-            return
+    def _transform_requirements(self, raw_requirements: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+        if raw_requirements.empty:
+            return {"requirements": []}
 
         requirements: list[dict[str, Any]] = []
         inquiry_rels: list[dict[str, Any]] = []
@@ -181,7 +198,7 @@ class CamaraInquiriesPipeline(Pipeline):
         author_name_rels: list[dict[str, Any]] = []
         mentions: list[dict[str, Any]] = []
 
-        for _, row in self._raw_requirements.iterrows():
+        for _, row in raw_requirements.iterrows():
             inquiry_id = self._get(row, "inquiry_id")
             if not inquiry_id:
                 continue
@@ -245,24 +262,22 @@ class CamaraInquiriesPipeline(Pipeline):
                     "source_ref": source_url or requirement_id,
                     "run_id": self.run_id,
                 })
+        return {
+            "requirements": deduplicate_rows(requirements, ["requirement_id"]),
+            "inquiry_requirement_rels": inquiry_rels,
+            "requirement_author_cpf_rels": author_cpf_rels,
+            "requirement_author_name_rels": author_name_rels,
+            "requirement_company_mentions": deduplicate_rows(mentions, ["cnpj", "target_key", "method"]),
+        }
 
-        self.requirements = deduplicate_rows(requirements, ["requirement_id"])
-        self.inquiry_requirement_rels = inquiry_rels
-        self.requirement_author_cpf_rels = author_cpf_rels
-        self.requirement_author_name_rels = author_name_rels
-        self.requirement_company_mentions = deduplicate_rows(
-            mentions,
-            ["cnpj", "target_key", "method"],
-        )
-
-    def _transform_sessions(self) -> None:
-        if self._raw_sessions.empty:
-            return
+    def _transform_sessions(self, raw_sessions: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+        if raw_sessions.empty:
+            return {"sessions": []} 
 
         sessions: list[dict[str, Any]] = []
         rels: list[dict[str, Any]] = []
 
-        for _, row in self._raw_sessions.iterrows():
+        for _, row in raw_sessions.iterrows():
             inquiry_id = self._get(row, "inquiry_id")
             if not inquiry_id:
                 continue

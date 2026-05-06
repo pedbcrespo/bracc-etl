@@ -1,11 +1,27 @@
+import pandas as pd
 import logging
+import psutil
 import os
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
+from typing import Any
 
 from neo4j import Driver
 
 logger = logging.getLogger(__name__)
+
+def calculate_dynamic_chunksize(row_size_estimate_kb: int = 2, target_memory_fraction: float = 0.1) -> int:
+    try:
+        available_mem_bytes = psutil.virtual_memory().available
+        available_mem_kb = available_mem_bytes / 1024
+        target_mem_kb = available_mem_kb * target_memory_fraction
+        chunk_size = int(target_mem_kb / row_size_estimate_kb)
+        chunk_size = max(10_000, min(chunk_size, 100_000))
+        return chunk_size
+        
+    except Exception as e:
+        logger.warning(f"Erro, default value 50.000: {e}")
+        return 50_000
 
 
 class Pipeline(ABC):
@@ -19,14 +35,14 @@ class Pipeline(ABC):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
+        chunk_size: int | None = None,
         neo4j_database: str | None = None,
         history: bool = False,
     ) -> None:
         self.driver = driver
         self.data_dir = data_dir
         self.limit = limit
-        self.chunk_size = chunk_size
+        self.chunk_size = chunk_size if chunk_size is not None else calculate_dynamic_chunksize()
         self.neo4j_database = neo4j_database or os.getenv("NEO4J_DATABASE", "neo4j")
         self.history = history
         self.rows_in: int = 0
@@ -35,16 +51,24 @@ class Pipeline(ABC):
         self.run_id = f"{source_key}_{datetime.now(tz=UTC).strftime('%Y%m%d%H%M%S')}"
 
     @abstractmethod
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame | list[Any] | dict[str, Any]:
         """Download raw data from source."""
 
     @abstractmethod
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame | list[Any] | dict[str, Any]) -> list[Any] | dict[str, Any]:
         """Normalize, deduplicate, and prepare data for loading."""
 
     @abstractmethod
-    def load(self) -> None:
+    def load(self, data: list[Any] | dict[str, Any]) -> None:
         """Load transformed data into Neo4j."""
+
+    def cleanup(self) -> None:
+        """Optional cleanup method to delete temporary attributes after run.
+        
+        Subclasses can override this to delete specific attributes (e.g., large DataFrames)
+        to free memory. By default, does nothing to avoid breaking essential attributes.
+        """
+        pass  # Subclasses can implement custom cleanup logic
 
     def run(self) -> None:
         """Execute the full ETL pipeline."""
@@ -52,11 +76,11 @@ class Pipeline(ABC):
         self._upsert_ingestion_run(status="running", started_at=started_at)
         try:
             logger.info("[%s] Starting extraction...", self.name)
-            self.extract()
+            data = self.extract()
             logger.info("[%s] Starting transformation...", self.name)
-            self.transform()
+            transformed_data = self.transform(data)
             logger.info("[%s] Starting load...", self.name)
-            self.load()
+            self.load(transformed_data)
             finished_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             self._upsert_ingestion_run(
                 status="loaded",
@@ -64,6 +88,7 @@ class Pipeline(ABC):
                 finished_at=finished_at,
             )
             logger.info("[%s] Pipeline complete.", self.name)
+            self.cleanup()
         except Exception as exc:
             finished_at = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             self._upsert_ingestion_run(

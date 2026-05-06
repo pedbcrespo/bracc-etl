@@ -36,17 +36,13 @@ class CepimPipeline(Pipeline):
         driver: Driver,
         data_dir: str = "./data",
         limit: int | None = None,
-        chunk_size: int = 50_000,
         **kwargs: Any,
     ) -> None:
-        super().__init__(driver, data_dir, limit=limit, chunk_size=chunk_size, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.ngos: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
+        super().__init__(driver, data_dir, limit=limit, **kwargs)
 
-    def extract(self) -> None:
+    def extract(self) -> pd.DataFrame:
         cepim_dir = Path(self.data_dir) / "cepim"
-        self._raw = pd.read_csv(
+        return pd.read_csv(
             cepim_dir / "cepim.csv",
             sep=";",
             dtype=str,
@@ -54,11 +50,11 @@ class CepimPipeline(Pipeline):
             keep_default_na=False,
         )
 
-    def transform(self) -> None:
+    def transform(self, data: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
         ngos: list[dict[str, Any]] = []
         company_rels: list[dict[str, Any]] = []
 
-        for _idx, row in self._raw.iterrows():
+        for _idx, row in data.iterrows():
             cnpj_raw = str(row.get("CNPJ ENTIDADE", ""))
             digits = strip_document(cnpj_raw)
 
@@ -90,27 +86,29 @@ class CepimPipeline(Pipeline):
                 "target_key": ngo_id,
             })
 
-        self.ngos = deduplicate_rows(ngos, ["ngo_id"])
-        self.company_rels = company_rels
+        return {
+            "ngos": deduplicate_rows(ngos, ["ngo_id"]),
+            "company_rels": company_rels
+        }
 
-    def load(self) -> None:
+    def load(self, transformed_data: dict[str, list[dict[str, Any]]]) -> None:
         loader = Neo4jBatchLoader(self.driver)
 
-        if self.ngos:
-            loader.load_nodes("BarredNGO", self.ngos, key_field="ngo_id")
+        if transformed_data["ngos"]:
+            loader.load_nodes("BarredNGO", transformed_data["ngos"], key_field="ngo_id")
 
         # Ensure Company nodes exist for CNPJ linking
-        if self.company_rels:
+        if transformed_data["company_rels"]:
             companies = [
-                {"cnpj": rel["source_key"]} for rel in self.company_rels
+                {"cnpj": rel["source_key"]} for rel in transformed_data["company_rels"]
             ]
             loader.load_nodes("Company", deduplicate_rows(companies, ["cnpj"]), key_field="cnpj")
 
-        if self.company_rels:
+        if transformed_data["company_rels"]:
             query = (
                 "UNWIND $rows AS row "
                 "MATCH (c:Company {cnpj: row.source_key}) "
                 "MATCH (b:BarredNGO {ngo_id: row.target_key}) "
                 "MERGE (c)-[:IMPEDIDA]->(b)"
             )
-            loader.run_query_with_retry(query, self.company_rels)
+            loader.run_query_with_retry(query, transformed_data["company_rels"])
