@@ -49,9 +49,6 @@ class RenunciasPipeline(Pipeline):
         **kwargs: Any,
     ) -> None:
         super().__init__(driver, data_dir, limit=limit, **kwargs)
-        self._raw: pd.DataFrame = pd.DataFrame()
-        self.waivers: list[dict[str, Any]] = []
-        self.company_rels: list[dict[str, Any]] = []
 
     def extract(self) -> pd.DataFrame:
         data_dir = Path(self.data_dir) / "renuncias"
@@ -69,6 +66,7 @@ class RenunciasPipeline(Pipeline):
                 delimiter=";",
                 encoding="latin-1",
                 keep_default_na=False,
+                chunksize=self.chunk_size,
             )
             frames.append(df)
 

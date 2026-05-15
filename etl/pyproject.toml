@@ -16,6 +16,7 @@ dependencies = [
     "pandera>=0.21.0",
     "requests>=2.32.5",
     "dbfread>=2.0.7",
+    "psutil>=7.2.2",
 ]
 
 [project.optional-dependencies]

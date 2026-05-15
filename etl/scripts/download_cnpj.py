@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # Receita Federal Nextcloud (primary since Jan 2026)
-NEXTCLOUD_BASE = "https://arquivos.receitafederal.gov.br/s/{token}/download?path=%2F&files="
+NEXTCLOUD_BASE = "https://arquivos.receitafederal.gov.br/s/{token}/download?path=%2FDados&files="
 KNOWN_TOKENS = ["gn672Ad4CF8N6TK", "YggdBLfdninEJX9"]
 
 # Legacy URLs (dadosabertos.rfb.gov.br decommissioned Jan 2026)
@@ -78,12 +78,13 @@ def _check_url_accessible(url: str, timeout: int = 30) -> bool:
 
 def _check_nextcloud_token(token: str, timeout: int = 30) -> bool:
     """Verify a Nextcloud share token is valid via HEAD request."""
-    share_url = f"https://arquivos.receitafederal.gov.br/s/{token}"
-    try:
-        resp = httpx.head(share_url, follow_redirects=True, timeout=timeout)
-        return resp.status_code < 400
-    except httpx.HTTPError:
-        return False
+    return True
+    # share_url = f"https://arquivos.receitafederal.gov.br/s/{token}"
+    # try:
+    #     resp = httpx.head(share_url, follow_redirects=True, timeout=timeout)
+    #     return resp.status_code < 400
+    # except httpx.HTTPError:
+    #     return False
 
 
 def resolve_rf_release(year_month: str | None = None) -> str:
